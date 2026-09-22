@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """
+PacBot autonomous controller for Task 1A.
+Uses BFS to navigate the maze grid, collect pellets, and exit.
 """
 
 from collections import deque
@@ -188,7 +190,7 @@ def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
 
 
 def parse_pellets(payload):
-    return {tuple(cell) for cell in json.loads(payload)}[cite: 2]
+    return {tuple(cell) for cell in json.loads(payload)}
 
 
 def main():
@@ -200,61 +202,65 @@ def main():
         "in_flight": False,
         "got_pose": False,
         "got_pellets": False,
-    }[cite: 2]
+    }
 
-    client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="Controller")[cite: 2]
+    # Supports both paho-mqtt v1.x and v2.x
+    if hasattr(mqtt, "CallbackAPIVersion"):
+        client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="Controller")
+    else:
+        client = mqtt.Client(client_id="Controller")
 
     def decide_and_send():
         if (not state["running"] or state["in_flight"]
-                or not state["got_pose"] or not state["got_pellets"]):[cite: 2]
-            return[cite: 2]
-        print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")[cite: 2]
-        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))[cite: 2]
-        if cmd is not None:[cite: 2]
-            state["in_flight"] = True[cite: 2]
-            client.publish(CMD_VEL_TOPIC, cmd)[cite: 2]
+                or not state["got_pose"] or not state["got_pellets"]):
+            return
+        print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")
+        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))
+        if cmd is not None:
+            state["in_flight"] = True
+            client.publish(CMD_VEL_TOPIC, cmd)
             print(f"[controller] {state['cell']} yaw={state['yaw']} -> {cmd}, "
-                  f"pellets_left={len(state['pellets'])}")[cite: 2]
+                  f"pellets_left={len(state['pellets'])}")
 
     def on_message(client, userdata, msg):
-        try:[cite: 2]
-            if msg.topic == BOT_CMD_TOPIC:[cite: 2]
-                running = msg.payload.decode().startswith("1")[cite: 2]
-                was_running = state["running"][cite: 2]
-                state["running"] = running[cite: 2]
-                if running and not was_running:[cite: 2]
-                    decide_and_send()   # kick off the reactive loop on Start[cite: 2]
-            elif msg.topic == PELLETS_TOPIC:[cite: 2]
-                state["pellets"] = parse_pellets(msg.payload.decode())[cite: 2]
-                state["got_pellets"] = True[cite: 2]
-                decide_and_send()[cite: 2]
-            elif msg.topic == POSE_TOPIC:[cite: 2]
-                data = json.loads(msg.payload.decode())[cite: 2]
-                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped[cite: 2]
-                state["got_pose"] = True[cite: 2]
-                state["yaw"] = float(data.get("yaw", 0.0))[cite: 2]
-                state["in_flight"] = False   # this pose is the ack for our last command[cite: 2]
-                decide_and_send()   # every pose/command-ack triggers the next step[cite: 2]
-        except Exception as e:[cite: 2]
-            print("[controller] mqtt parse error:", e)[cite: 2]
+        try:
+            if msg.topic == BOT_CMD_TOPIC:
+                running = msg.payload.decode().startswith("1")
+                was_running = state["running"]
+                state["running"] = running
+                if running and not was_running:
+                    decide_and_send()   # kick off the reactive loop on Start
+            elif msg.topic == PELLETS_TOPIC:
+                state["pellets"] = parse_pellets(msg.payload.decode())
+                state["got_pellets"] = True
+                decide_and_send()
+            elif msg.topic == POSE_TOPIC:
+                data = json.loads(msg.payload.decode())
+                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped
+                state["got_pose"] = True
+                state["yaw"] = float(data.get("yaw", 0.0))
+                state["in_flight"] = False   # this pose is the ack for our last command
+                decide_and_send()   # every pose/command-ack triggers the next step
+        except Exception as e:
+            print("[controller] mqtt parse error:", e)
 
-    client.on_message = on_message[cite: 2]
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)[cite: 2]
-    client.subscribe([(BOT_CMD_TOPIC, 0), (PELLETS_TOPIC, 0), (POSE_TOPIC, 0)])[cite: 2]
-    client.loop_start()[cite: 2]
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.subscribe([(BOT_CMD_TOPIC, 0), (PELLETS_TOPIC, 0), (POSE_TOPIC, 0)])
+    client.loop_start()
 
     print(f"[controller] ready; sending one '{CMD_VEL_TOPIC}' command at a time, "
-          f"reacting to '{POSE_TOPIC}'/'{PELLETS_TOPIC}' feedback")[cite: 2]
+          f"reacting to '{POSE_TOPIC}'/'{PELLETS_TOPIC}' feedback")
 
-    try:[cite: 2]
-        while True:[cite: 2]
-            time.sleep(0.2)  [cite: 2]
-    except KeyboardInterrupt:[cite: 2]
-        pass[cite: 2]
-    finally:[cite: 2]
-        client.loop_stop()[cite: 2]
-        client.disconnect()[cite: 2]
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.loop_stop()
+        client.disconnect()
 
 
 if __name__ == "__main__":
-    main()[cite: 2]
+    main()
