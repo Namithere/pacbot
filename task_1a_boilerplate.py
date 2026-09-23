@@ -34,38 +34,6 @@ WALLS = [
     [10, 10, 9, 6, 10, 12, 2, 8, 1, 7, 12, 0, 2],
     [9, 1, 5, 1, 1, 3, 8, 1, 5, 5, 3, 9, 3],
 ]
-# Maze map -- the same data as WALLS above, drawn. row 0 = SOUTH (bottom),
-# col 0 = WEST (left). The gaps in the top and bottom edges are EXIT_CELLS.
-#
-#            0  1  2  3  4  5  6  7  8  9 10 11 12   <- col
-#          +--+--+--+--+--+--+  +--+--+--+--+--+--+
-#   row 12 |                 |              |     |
-#          +  +  +--+  +  +  +  +  +--+--+  +  +  +
-#   row 11 |  |  |     |  |     |        |        |
-#          +  +  +  +--+  +--+  +  +  +--+--+  +  +
-#   row 10 |           |     |     |  |        |  |
-#          +  +  +--+--+--+  +--+--+  +  +  +  +  +
-#   row  9 |  |           |        |        |     |
-#          +--+  +  +  +  +--+  +  +--+--+  +--+--+
-#   row  8 |     |  |  |        |                 |
-#          +  +--+  +  +--+  +  +--+--+  +  +  +  +
-#   row  7 |        |     |  |     |     |     |  |
-#          +  +  +  +--+  +  +--+  +  +  +--+--+  +
-#   row  6 |  |           |  |     |  |           |
-#          +  +--+--+  +--+  +  +--+  +  +--+--+  +
-#   row  5 |     |           |        |  |        |
-#          +  +  +  +--+--+--+  +  +--+  +  +--+  +
-#   row  4 |  |  |        |     |  |     |  |  |  |
-#          +  +  +  +--+  +--+  +  +  +--+  +  +  +
-#   row  3 |  |        |              |        |  |
-#          +  +--+--+  +--+  +--+  +--+  +--+  +  +
-#   row  2 |        |        |     |     |     |  |
-#          +  +--+  +  +  +--+  +  +  +--+--+  +  +
-#   row  1 |  |  |  |  |     |     |           |  |
-#          +  +  +  +  +--+  +  +  +--+  +  +--+  +
-#   row  0 |     |     |                 |        |
-#          +--+--+--+--+--+--+  +--+--+--+--+--+--+
-#            0  1  2  3  4  5  6  7  8  9 10 11 12   <- col
 
 # the 2 known exits: (row, col, facing)
 EXIT_CELLS = [
@@ -196,7 +164,7 @@ def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
 
 
 def parse_pellets(payload):
-    return {tuple(cell) for cell in json.loads(payload)}[cite: 3]
+    return {tuple(cell) for cell in json.loads(payload)}
 
 
 def main():
@@ -208,7 +176,7 @@ def main():
         "in_flight": False,
         "got_pose": False,
         "got_pellets": False,
-    }[cite: 3]
+    }
 
     # Supports both paho-mqtt v1.x and v2.x
     if hasattr(mqtt, "CallbackAPIVersion"):
@@ -218,55 +186,55 @@ def main():
 
     def decide_and_send():
         if (not state["running"] or state["in_flight"]
-                or not state["got_pose"] or not state["got_pellets"]):[cite: 3]
-            return[cite: 3]
-        print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")[cite: 3]
-        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))[cite: 3]
-        if cmd is not None:[cite: 3]
-            state["in_flight"] = True[cite: 3]
-            client.publish(CMD_VEL_TOPIC, cmd)[cite: 3]
+                or not state["got_pose"] or not state["got_pellets"]):
+            return
+        print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")
+        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))
+        if cmd is not None:
+            state["in_flight"] = True
+            client.publish(CMD_VEL_TOPIC, cmd)
             print(f"[controller] {state['cell']} yaw={state['yaw']} -> {cmd}, "
-                  f"pellets_left={len(state['pellets'])}")[cite: 3]
+                  f"pellets_left={len(state['pellets'])}")
 
     def on_message(client, userdata, msg):
-        try:[cite: 3]
-            if msg.topic == BOT_CMD_TOPIC:[cite: 3]
-                running = msg.payload.decode().startswith("1")[cite: 3]
-                was_running = state["running"][cite: 3]
-                state["running"] = running[cite: 3]
-                if running and not was_running:[cite: 3]
-                    decide_and_send()   # kick off the reactive loop on Start[cite: 3]
-            elif msg.topic == PELLETS_TOPIC:[cite: 3]
-                state["pellets"] = parse_pellets(msg.payload.decode())[cite: 3]
-                state["got_pellets"] = True[cite: 3]
-                decide_and_send()[cite: 3]
-            elif msg.topic == POSE_TOPIC:[cite: 3]
-                data = json.loads(msg.payload.decode())[cite: 3]
-                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped[cite: 3]
-                state["got_pose"] = True[cite: 3]
-                state["yaw"] = float(data.get("yaw", 0.0))[cite: 3]
-                state["in_flight"] = False   # this pose is the ack for our last command[cite: 3]
-                decide_and_send()   # every pose/command-ack triggers the next step[cite: 3]
-        except Exception as e:[cite: 3]
-            print("[controller] mqtt parse error:", e)[cite: 3]
+        try:
+            if msg.topic == BOT_CMD_TOPIC:
+                running = msg.payload.decode().startswith("1")
+                was_running = state["running"]
+                state["running"] = running
+                if running and not was_running:
+                    decide_and_send()   # kick off the reactive loop on Start
+            elif msg.topic == PELLETS_TOPIC:
+                state["pellets"] = parse_pellets(msg.payload.decode())
+                state["got_pellets"] = True
+                decide_and_send()
+            elif msg.topic == POSE_TOPIC:
+                data = json.loads(msg.payload.decode())
+                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped
+                state["got_pose"] = True
+                state["yaw"] = float(data.get("yaw", 0.0))
+                state["in_flight"] = False   # this pose is the ack for our last command
+                decide_and_send()   # every pose/command-ack triggers the next step
+        except Exception as e:
+            print("[controller] mqtt parse error:", e)
 
-    client.on_message = on_message[cite: 3]
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)[cite: 3]
-    client.subscribe([(BOT_CMD_TOPIC, 0), (PELLETS_TOPIC, 0), (POSE_TOPIC, 0)])[cite: 3]
-    client.loop_start()[cite: 3]
+    client.on_message = on_message
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)
+    client.subscribe([(BOT_CMD_TOPIC, 0), (PELLETS_TOPIC, 0), (POSE_TOPIC, 0)])
+    client.loop_start()
 
     print(f"[controller] ready; sending one '{CMD_VEL_TOPIC}' command at a time, "
-          f"reacting to '{POSE_TOPIC}'/'{PELLETS_TOPIC}' feedback")[cite: 3]
+          f"reacting to '{POSE_TOPIC}'/'{PELLETS_TOPIC}' feedback")
 
-    try:[cite: 3]
-        while True:[cite: 3]
-            time.sleep(0.2)[cite: 3]
-    except KeyboardInterrupt:[cite: 3]
-        pass[cite: 3]
-    finally:[cite: 3]
-        client.loop_stop()[cite: 3]
-        client.disconnect()[cite: 3]
+    try:
+        while True:
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        client.loop_stop()
+        client.disconnect()
 
 
 if __name__ == "__main__":
-    main()[cite: 3]
+    main()
