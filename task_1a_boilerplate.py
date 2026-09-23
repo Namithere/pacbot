@@ -93,6 +93,12 @@ def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
     """FRONT/LEFT/RIGHT/BACK to send now, or None. pacbot_cell=(row,col),
     pacbot_yaw one of HEADING_DELTA's keys, pellets_remaining=set of
     (row,col). Implement this -- see EXIT_CELLS above for the 2 exits."""
+    r, c = pacbot_cell
+
+    # Guard: If the robot stepped outside the maze boundaries on exit, stop sending commands
+    if not (0 <= r < MAZE_ROWS and 0 <= c < MAZE_COLS):
+        return None
+
     facing_to_yaw = {
         'east': 0.0,
         'north': 90.0,
@@ -102,7 +108,7 @@ def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
 
     current_yaw = float(pacbot_yaw) % 360.0
 
-    # 1. If all pellets are gathered and robot is on an exit cell, step out
+    # 1. If all pellets are collected and the robot is on an exit cell, step out
     if not pellets_remaining:
         for ex_r, ex_c, ex_facing in EXIT_CELLS:
             if pacbot_cell == (ex_r, ex_c):
@@ -121,7 +127,7 @@ def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
     if pellets_remaining:
         goals = set(pellets_remaining)
     else:
-        goals = {(r, c) for r, c, _ in EXIT_CELLS}
+        goals = {(gr, gc) for gr, gc, _ in EXIT_CELLS}
 
     # 3. Breadth-First Search to find the shortest path to the closest target
     queue = deque([pacbot_cell])
@@ -190,7 +196,7 @@ def choose_command(pacbot_cell, pacbot_yaw, pellets_remaining):
 
 
 def parse_pellets(payload):
-    return {tuple(cell) for cell in json.loads(payload)}
+    return {tuple(cell) for cell in json.loads(payload)}[cite: 3]
 
 
 def main():
@@ -202,7 +208,7 @@ def main():
         "in_flight": False,
         "got_pose": False,
         "got_pellets": False,
-    }
+    }[cite: 3]
 
     # Supports both paho-mqtt v1.x and v2.x
     if hasattr(mqtt, "CallbackAPIVersion"):
@@ -212,55 +218,55 @@ def main():
 
     def decide_and_send():
         if (not state["running"] or state["in_flight"]
-                or not state["got_pose"] or not state["got_pellets"]):
-            return
-        print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")
-        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))
-        if cmd is not None:
-            state["in_flight"] = True
-            client.publish(CMD_VEL_TOPIC, cmd)
+                or not state["got_pose"] or not state["got_pellets"]):[cite: 3]
+            return[cite: 3]
+        print(f"[debug] pose={state['cell']} yaw={state['yaw']} pellets={state['pellets']}")[cite: 3]
+        cmd = choose_command(state["cell"], state["yaw"], set(state["pellets"]))[cite: 3]
+        if cmd is not None:[cite: 3]
+            state["in_flight"] = True[cite: 3]
+            client.publish(CMD_VEL_TOPIC, cmd)[cite: 3]
             print(f"[controller] {state['cell']} yaw={state['yaw']} -> {cmd}, "
-                  f"pellets_left={len(state['pellets'])}")
+                  f"pellets_left={len(state['pellets'])}")[cite: 3]
 
     def on_message(client, userdata, msg):
-        try:
-            if msg.topic == BOT_CMD_TOPIC:
-                running = msg.payload.decode().startswith("1")
-                was_running = state["running"]
-                state["running"] = running
-                if running and not was_running:
-                    decide_and_send()   # kick off the reactive loop on Start
-            elif msg.topic == PELLETS_TOPIC:
-                state["pellets"] = parse_pellets(msg.payload.decode())
-                state["got_pellets"] = True
-                decide_and_send()
-            elif msg.topic == POSE_TOPIC:
-                data = json.loads(msg.payload.decode())
-                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped
-                state["got_pose"] = True
-                state["yaw"] = float(data.get("yaw", 0.0))
-                state["in_flight"] = False   # this pose is the ack for our last command
-                decide_and_send()   # every pose/command-ack triggers the next step
-        except Exception as e:
-            print("[controller] mqtt parse error:", e)
+        try:[cite: 3]
+            if msg.topic == BOT_CMD_TOPIC:[cite: 3]
+                running = msg.payload.decode().startswith("1")[cite: 3]
+                was_running = state["running"][cite: 3]
+                state["running"] = running[cite: 3]
+                if running and not was_running:[cite: 3]
+                    decide_and_send()   # kick off the reactive loop on Start[cite: 3]
+            elif msg.topic == PELLETS_TOPIC:[cite: 3]
+                state["pellets"] = parse_pellets(msg.payload.decode())[cite: 3]
+                state["got_pellets"] = True[cite: 3]
+                decide_and_send()[cite: 3]
+            elif msg.topic == POSE_TOPIC:[cite: 3]
+                data = json.loads(msg.payload.decode())[cite: 3]
+                state["cell"] = (int(data["col"]), int(data["row"]))   # wire is swapped[cite: 3]
+                state["got_pose"] = True[cite: 3]
+                state["yaw"] = float(data.get("yaw", 0.0))[cite: 3]
+                state["in_flight"] = False   # this pose is the ack for our last command[cite: 3]
+                decide_and_send()   # every pose/command-ack triggers the next step[cite: 3]
+        except Exception as e:[cite: 3]
+            print("[controller] mqtt parse error:", e)[cite: 3]
 
-    client.on_message = on_message
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    client.subscribe([(BOT_CMD_TOPIC, 0), (PELLETS_TOPIC, 0), (POSE_TOPIC, 0)])
-    client.loop_start()
+    client.on_message = on_message[cite: 3]
+    client.connect(MQTT_BROKER, MQTT_PORT, 60)[cite: 3]
+    client.subscribe([(BOT_CMD_TOPIC, 0), (PELLETS_TOPIC, 0), (POSE_TOPIC, 0)])[cite: 3]
+    client.loop_start()[cite: 3]
 
     print(f"[controller] ready; sending one '{CMD_VEL_TOPIC}' command at a time, "
-          f"reacting to '{POSE_TOPIC}'/'{PELLETS_TOPIC}' feedback")
+          f"reacting to '{POSE_TOPIC}'/'{PELLETS_TOPIC}' feedback")[cite: 3]
 
-    try:
-        while True:
-            time.sleep(0.2)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        client.loop_stop()
-        client.disconnect()
+    try:[cite: 3]
+        while True:[cite: 3]
+            time.sleep(0.2)[cite: 3]
+    except KeyboardInterrupt:[cite: 3]
+        pass[cite: 3]
+    finally:[cite: 3]
+        client.loop_stop()[cite: 3]
+        client.disconnect()[cite: 3]
 
 
 if __name__ == "__main__":
-    main()
+    main()[cite: 3]
