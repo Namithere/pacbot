@@ -32,17 +32,17 @@ class ControllerState:
 
         # Thresholds (meters)
         self.target_dist = 0.12
-        self.front_wall_dist = 0.18
-        self.max_side_range = 0.30
+        self.front_wall_dist = 0.22   # Initiates turn earlier to accommodate high speed
+        self.max_side_range = 0.32
 
-        # Wheel speeds (rad/s)
-        self.base_speed = 25.0
-        self.turn_speed = 14.0
+        # Wheel speeds (rad/s) — High-speed tuning
+        self.base_speed = 48.0        # High forward cruise velocity
+        self.turn_speed = 22.0        # Rapid in-place pivot velocity
 
-        # PID gains
-        self.Kp = 45.0
-        self.Ki = 0.1
-        self.Kd = 2.0
+        # PID gains adjusted for high velocity
+        self.Kp = 55.0
+        self.Ki = 0.05
+        self.Kd = 3.5
 
 
 ctrl = ControllerState()
@@ -124,12 +124,16 @@ def on_message(client, userdata, msg):
 
             if side is not None:
                 ctrl.integral += error * dt
-                ctrl.integral = max(-1.0, min(1.0, ctrl.integral))
+                ctrl.integral = max(-0.5, min(0.5, ctrl.integral))
 
                 derivative = (error - ctrl.prev_error) / dt if dt > 0 else 0.0
                 ctrl.prev_error = error
 
                 steering = (ctrl.Kp * error) + (ctrl.Ki * ctrl.integral) + (ctrl.Kd * derivative)
+
+                # Clamp steering differential to preserve forward progress
+                max_steer = ctrl.base_speed * 0.6
+                steering = max(-max_steer, min(max_steer, steering))
 
                 if side == "RIGHT":
                     left_vel = ctrl.base_speed + steering
