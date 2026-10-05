@@ -17,20 +17,21 @@ MQTT_PORT = 1883
 TOPIC_SENSORS = "pacbot/sensors"
 TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 
-# --- Navigation Parameters ---
-MAX_SPEED = 4.0              # Forward cruising speed (rad/s)
-MIN_SPEED = 0.5              # Minimum approach crawl speed (rad/s)
-TURN_SPEED = 2.5             # In-place turn speed (rad/s)
+# --- Navigation & Speed Parameters ---
+BASE_SPEED = 8.0             # Set to base speed 8
+CRAWL_SPEED = 1.0            # Speed for the final approach
+TURN_SPEED = 3.5             # In-place rotation speed
 
-# Thresholds
-STOP_DIST = 0.050            # Trigger immediate in-place turn at 0.05m
-SLOW_DIST = 0.220            # Start proportional deceleration within corridor cell
+# Corridor & Stopping Thresholds
+STOP_DIST = 0.050            # Stops at 0.05m from the wall
+DECEL_DIST = 0.220           # Begin braking within cell distance
 
 # --- State Machine Tracking ---
-# States: 'MOVE_FORWARD', 'TURNING'
+# States: 'MOVE_FORWARD', 'STOPPED', 'TURNING'
 state = 'MOVE_FORWARD'
 accumulated_yaw = 0.0
 target_angle = 0.0
+stop_delay_ticks = 0
 
 
 def _mqtt_client():
@@ -42,7 +43,7 @@ def _mqtt_client():
 
 
 def on_message(client, userdata, msg):
-    global state, accumulated_yaw, target_angle
+    global state, accumulated_yaw, target_angle, stop_delay_ticks
 
     data = json.loads(msg.payload.decode())
 
@@ -59,34 +60,47 @@ def on_message(client, userdata, msg):
 
     if state == 'MOVE_FORWARD':
         if front_dist <= STOP_DIST:
-            # Immediately trigger in-place turn upon reaching 0.05m
-            accumulated_yaw = 0.0
-
-            # Turn toward whichever side has more clearance
-            if sl > sr:
-                target_angle = math.pi / 2.0   # Turn Left (+90 deg)
-                left_vel = -TURN_SPEED
-                right_vel = TURN_SPEED
-            else:
-                target_angle = -math.pi / 2.0  # Turn Right (-90 deg)
-                left_vel = TURN_SPEED
-                right_vel = -TURN_SPEED
-
-            state = 'TURNING'
+            # 1. Stop completely before taking the turn
+            state = 'STOPPED'
+            stop_delay_ticks = 0
+            left_vel = 0.0
+            right_vel = 0.0
         else:
-            # Slow down proportionally to avoid crashing before reaching 0.05m
-            if front_dist < SLOW_DIST:
-                ratio = (front_dist - STOP_DIST) / (SLOW_DIST - STOP_DIST)
+            # Smooth proportional deceleration to stop cleanly at 0.05m
+            if front_dist < DECEL_DIST:
+                ratio = (front_dist - STOP_DIST) / (DECEL_DIST - STOP_DIST)
                 ratio = max(0.0, min(1.0, ratio))
-                speed = MIN_SPEED + (MAX_SPEED - MIN_SPEED) * ratio
+                speed = CRAWL_SPEED + (BASE_SPEED - CRAWL_SPEED) * ratio
             else:
-                speed = MAX_SPEED
+                speed = BASE_SPEED
 
             left_vel = speed
             right_vel = speed
 
+    elif state == 'STOPPED':
+        # Ensure wheels are completely stationary and eliminate forward momentum
+        left_vel = 0.0
+        right_vel = 0.0
+        stop_delay_ticks += 1
+
+        # Hold stationary for a brief settle window (~16ms at 500Hz)
+        if stop_delay_ticks >= 8:
+            accumulated_yaw = 0.0
+
+            # 2. Check which wall is farther away (left vs right) and target 90 degrees
+            if sl > sr:
+                target_angle = math.pi / 2.0   # Left turn (+90 deg)
+                left_vel = -TURN_SPEED
+                right_vel = TURN_SPEED
+            else:
+                target_angle = -math.pi / 2.0  # Right turn (-90 deg)
+                left_vel = TURN_SPEED
+                right_vel = -TURN_SPEED
+
+            state = 'TURNING'
+
     elif state == 'TURNING':
-        # Integrate yaw rate
+        # Integrate gyro angular velocity over time
         accumulated_yaw += yaw_rate * dt
 
         is_turn_done = False
@@ -103,12 +117,12 @@ def on_message(client, userdata, msg):
                 left_vel = TURN_SPEED
                 right_vel = -TURN_SPEED
 
-        # Resume forward drive once 90-degree turn is reached
+        # 3. Once 90 degrees completed, continue straight at base speed
         if is_turn_done:
             accumulated_yaw = 0.0
             state = 'MOVE_FORWARD'
-            left_vel = MIN_SPEED
-            right_vel = MIN_SPEED
+            left_vel = BASE_SPEED
+            right_vel = BASE_SPEED
 
     client.publish(TOPIC_WHEEL_VEL, json.dumps({
         "left": float(left_vel), "right": float(right_vel),
