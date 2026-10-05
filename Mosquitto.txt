@@ -14,4 +14,44 @@ max_queued_messages 0
 message_size_limit 0
 EOF'
 
-sudo systemctl restart mosquitto
+sudo systemctl restart mosquito
+
+python3 -c "
+import paho.mqtt.client as mqtt, time
+count = 0
+start = time.time()
+def on_msg(c, u, m):
+    global count, start
+    count += 1
+    now = time.time()
+    if now - start >= 1.0:
+        print(f'Sensor loop rate: {count / (now - start):.1f} Hz')
+        count, start = 0, now
+c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+c.on_message = on_msg
+c.connect('localhost', 1883)
+c.subscribe('pacbot/sensors')
+c.loop_forever()
+"
+
+mosquitto_sub -h localhost -t "pacbot/wheel_vel" -v
+
+
+top -p $(pgrep -d',' -f "task_1b|mosquitto")
+
+glxinfo | grep "OpenGL renderer"
+
+python3 -c "
+import paho.mqtt.client as mqtt, json
+def on_msg(c, u, m):
+    d = json.loads(m.payload.decode())
+    print(f'dt: {d.get(\"dt\"):.4f}s | front_min: {min(d[\"fl\"], d[\"fr\"]):.3f}m | sl: {d[\"sl\"]:.3f}m | sr: {d[\"sr\"]:.3f}m')
+c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+c.on_message = on_msg
+c.connect('localhost', 1883)
+c.subscribe('pacbot/sensors')
+c.loop_forever()
+"
+
+mosquitto_sub -h localhost -t "\$SYS/broker/messages/stored" -C 1
+mosquitto_sub -h localhost -t "\$SYS/broker/publish/messages/dropped" -C 1
