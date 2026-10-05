@@ -21,24 +21,25 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
-SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = previous version)
+SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = original speed)
 BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, cruising wheel speed
 MAX_WHEEL = 16.0 * SPEED_SCALE     # rad/s, saturation limit
+MIN_SPEED = 8.0            # rad/s, creep speed when right at a wall
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
 WALL_TARGET = 0.05         # m, desired distance to the tracked wall (close walls)
-FRONT_STOP = 0.09          # m, front wall closer than this -> stop and turn
+FRONT_STOP = 0.12          # m, front wall closer than this -> stop and turn
+BRAKE_ZONE = 0.60          # m, start slowing this far before FRONT_STOP
 OPEN_THRESH = 0.15         # m, side reading above this -> wall has disappeared
 ADVANCE_T = 0.15 / SPEED_SCALE     # s, drive straight into a gap before turning into it
 ENTER_T = 0.24 / SPEED_SCALE       # s, drive straight after a turn before following a wall
 
-WALL_KP, WALL_KI, WALL_KD = 80.0, 0.5, 6.0     # wall-distance PID
+WALL_KP, WALL_KI, WALL_KD = 40.0, 0.5, 8.0     # wall-distance PID
 TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
 HOLD_KP, HOLD_KI, HOLD_KD = 8.0, 0.0, 0.2      # heading PID (straight-line hold)
 TURN_MAX = 8.0             # rad/s, max wheel speed during in-place turns
 HOLD_MAX = 4.0 * SPEED_SCALE   # rad/s, max correction while holding heading
 TURN_TOL = math.radians(2.5)   # rad, heading error considered "done"
-SLOW_ZONE = 0.12           # m, start easing off the throttle this far past FRONT_STOP
 
 
 class PID:
@@ -94,6 +95,16 @@ def _clamp(v):
     return max(-MAX_WHEEL, min(MAX_WHEEL, v))
 
 
+def _approach_speed(front):
+    """Cruise speed scaled down linearly as a front wall gets closer.
+
+    Full speed at FRONT_STOP + BRAKE_ZONE or farther, MIN_SPEED at FRONT_STOP.
+    """
+    frac = (front - FRONT_STOP) / BRAKE_ZONE
+    frac = max(0.0, min(1.0, frac))
+    return MIN_SPEED + (BASE_SPEED - MIN_SPEED) * frac
+
+
 def _start_turn(angle):
     """Begin an in-place turn of `angle` rad (+ = left/CCW, - = right/CW)."""
     _state["target"] = _state["heading"] + angle
@@ -114,6 +125,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     _state["heading"] += yaw_rate * dt          # gyro-integrated heading
 
     front = min(fl, fr)
+    speed = _approach_speed(front)              # brakes automatically near walls
     mode = _state["mode"]
 
     # ---- TURN: rotate in place using gyro heading ----
@@ -133,7 +145,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
         if front < FRONT_STOP:
             _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
             return 0.0, 0.0
-        return _hold_straight(BASE_SPEED, dt)
+        return _hold_straight(speed, dt)
 
     # ---- ENTER: go straight after a turn, then start following the nearer wall ----
     if mode == "ENTER":
@@ -145,7 +157,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             _state["side"] = "L" if sl <= sr else "R"
             _state["mode"] = "FOLLOW"
             _wall_pid.reset()
-        return _hold_straight(BASE_SPEED, dt)
+        return _hold_straight(speed, dt)
 
     # ---- ADVANCE: wall disappeared -> roll forward into the gap, then turn that way ----
     if mode == "ADVANCE":
@@ -153,7 +165,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
         if front < FRONT_STOP or _state["timer"] <= 0.0:
             _start_turn(_state["next_turn"])
             return 0.0, 0.0
-        return _hold_straight(BASE_SPEED, dt)
+        return _hold_straight(speed, dt)
 
     # ---- FOLLOW: PID on distance to the tracked wall ----
     follow_left = _state["side"] == "L"
@@ -169,12 +181,10 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
         _state["mode"] = "ADVANCE"
         _state["timer"] = ADVANCE_T
         _state["next_turn"] = math.pi / 2 if follow_left else -math.pi / 2
-        return _hold_straight(BASE_SPEED, dt)
+        return _hold_straight(speed, dt)
 
     err = side - WALL_TARGET                    # + = too far from the wall
     u = _wall_pid.update(err, dt)               # + = steer toward the wall
-    # Ease off the throttle only when a front wall is close
-    speed = BASE_SPEED * min(1.0, max(0.5, (front - FRONT_STOP) / SLOW_ZONE))
     if follow_left:
         left, right = speed - u, speed + u      # steer left toward the wall
     else:
