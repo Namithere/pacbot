@@ -1,0 +1,17 @@
+sudo bash -c 'cat <<EOF > /etc/mosquitto/conf.d/tuning.conf
+listener 1883
+allow_anonymous true
+
+# Keep all broker state in RAM; avoid disk sync stalls
+persistence false
+
+# Disable disk logging so high-frequency simulator packets do not block I/O
+log_dest none
+
+# Remove queues and allow instant in-flight delivery
+max_inflight_messages 0
+max_queued_messages 0
+message_size_limit 0
+EOF'
+
+sudo systemctl restart mosquitto
