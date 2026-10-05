@@ -21,21 +21,22 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
-BASE_SPEED = 10.0          # rad/s, cruising wheel speed
-MAX_WHEEL = 16.0           # rad/s, saturation limit
+SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = previous version)
+BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, cruising wheel speed
+MAX_WHEEL = 16.0 * SPEED_SCALE     # rad/s, saturation limit
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
 WALL_TARGET = 0.05         # m, desired distance to the tracked wall (close walls)
 FRONT_STOP = 0.09          # m, front wall closer than this -> stop and turn
 OPEN_THRESH = 0.15         # m, side reading above this -> wall has disappeared
-ADVANCE_T = 0.15           # s, drive straight into a gap before turning into it
-ENTER_T = 0.24             # s, drive straight after a turn before following a wall
+ADVANCE_T = 0.15 / SPEED_SCALE     # s, drive straight into a gap before turning into it
+ENTER_T = 0.24 / SPEED_SCALE       # s, drive straight after a turn before following a wall
 
 WALL_KP, WALL_KI, WALL_KD = 80.0, 0.5, 6.0     # wall-distance PID
 TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
 HOLD_KP, HOLD_KI, HOLD_KD = 8.0, 0.0, 0.2      # heading PID (straight-line hold)
 TURN_MAX = 8.0             # rad/s, max wheel speed during in-place turns
-HOLD_MAX = 4.0             # rad/s, max correction while holding heading
+HOLD_MAX = 4.0 * SPEED_SCALE   # rad/s, max correction while holding heading
 TURN_TOL = math.radians(2.5)   # rad, heading error considered "done"
 SLOW_ZONE = 0.12           # m, start easing off the throttle this far past FRONT_STOP
 
