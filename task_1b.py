@@ -8,55 +8,59 @@ MQTT_PORT = 1883
 TOPIC_SENSORS = "pacbot/sensors"
 TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 
-# ================= CONTROLLER SETTINGS =================
 
-BASE_SPEED = 6.0
-MAX_WHEEL = 10.0
+# =========================================================
+# PARAMETERS
+# =========================================================
+
+BASE_SPEED = 5.0
+MAX_SPEED = 8.0
 MIN_SPEED = 2.0
+
+WALL_DISTANCE = 0.08
+
+FRONT_STOP = 0.12
+FRONT_SLOW = 0.35
+
+WALL_DETECT = 0.30
+
+TURN_SPEED = 3.5
+TURN_ANGLE = math.pi / 2
+
+TURN_TOLERANCE = math.radians(4)
 
 MAX_RANGE = 2.0
 
-WALL_TARGET = 0.08
-FRONT_STOP = 0.10
-BRAKE_ZONE = 0.40
-
-OPEN_THRESH = 0.25
-
-TURN_ANGLE = math.pi / 2
-TURN_TOL = math.radians(3)
-
-STOP_TIME = 0.10
 
 # Wall PID
-WALL_KP = 35.0
-WALL_KI = 0.0
-WALL_KD = 3.0
+KP = 30.0
+KI = 0.0
+KD = 2.5
 
 # Turn PID
-TURN_KP = 5.0
-TURN_KI = 0.0
-TURN_KD = 0.25
-
-# Heading PID
-HOLD_KP = 3.0
-HOLD_KI = 0.0
-HOLD_KD = 0.15
+TKP = 5.0
+TKD = 0.25
 
 
-# ================= PID =================
+# =========================================================
+# PID
+# =========================================================
 
 class PID:
 
     def __init__(self, kp, ki, kd, limit):
+
         self.kp = kp
         self.ki = ki
         self.kd = kd
+
         self.limit = limit
 
         self.integral = 0.0
         self.previous = None
 
     def reset(self):
+
         self.integral = 0.0
         self.previous = None
 
@@ -80,122 +84,141 @@ class PID:
             self.kd * derivative
         )
 
-        return max(-self.limit, min(self.limit, output))
+        return max(
+            -self.limit,
+            min(self.limit, output)
+        )
 
 
 wall_pid = PID(
-    WALL_KP,
-    WALL_KI,
-    WALL_KD,
-    BASE_SPEED
+    KP,
+    KI,
+    KD,
+    3.0
 )
 
 turn_pid = PID(
-    TURN_KP,
-    TURN_KI,
-    TURN_KD,
-    BASE_SPEED
-)
-
-hold_pid = PID(
-    HOLD_KP,
-    HOLD_KI,
-    HOLD_KD,
-    BASE_SPEED / 2
+    TKP,
+    0.0,
+    TKD,
+    TURN_SPEED
 )
 
 
-# ================= STATE =================
+# =========================================================
+# STATE
+# =========================================================
 
-state = {
+mode = "DRIVE"
 
-    "mode": "DRIVE",
+heading = 0.0
+target_heading = 0.0
 
-    "heading": 0.0,
+turn_direction = 1
 
-    "target_heading": 0.0,
-
-    "turn_direction": 0.0,
-
-    "stop_timer": 0.0,
-
-    "wall_side": None
-}
+wall_side = None
 
 
-# ================= UTILITY =================
+# =========================================================
+# UTILITY
+# =========================================================
 
-def clean(value):
+def clean(x):
 
     try:
-        value = float(value)
+        x = float(x)
     except:
         return MAX_RANGE
 
-    if math.isnan(value):
+    if math.isnan(x):
         return MAX_RANGE
 
-    if math.isinf(value):
+    if math.isinf(x):
         return MAX_RANGE
 
-    if value < 0:
+    if x < 0:
         return MAX_RANGE
 
-    return min(value, MAX_RANGE)
+    return min(x, MAX_RANGE)
 
 
-def clamp(value):
+def clamp(x, low=-MAX_SPEED, high=MAX_SPEED):
 
-    return max(-MAX_WHEEL, min(MAX_WHEEL, value))
-
-
-def normalize_angle(angle):
-
-    while angle > math.pi:
-        angle -= 2 * math.pi
-
-    while angle < -math.pi:
-        angle += 2 * math.pi
-
-    return angle
+    return max(low, min(high, x))
 
 
-def speed_from_front(front):
+def angle_error(target, current):
 
-    if front >= FRONT_STOP + BRAKE_ZONE:
+    error = target - current
+
+    while error > math.pi:
+        error -= 2 * math.pi
+
+    while error < -math.pi:
+        error += 2 * math.pi
+
+    return error
+
+
+def get_speed(front):
+
+    if front >= FRONT_SLOW:
         return BASE_SPEED
+
+    if front <= FRONT_STOP:
+        return MIN_SPEED
 
     ratio = (
         (front - FRONT_STOP) /
-        BRAKE_ZONE
+        (FRONT_SLOW - FRONT_STOP)
     )
-
-    ratio = max(0.0, min(1.0, ratio))
 
     return MIN_SPEED + (
         BASE_SPEED - MIN_SPEED
     ) * ratio
 
 
-# ================= START TURN =================
+# =========================================================
+# START TURN
+# =========================================================
 
 def start_turn(sl, sr):
 
-    if sl >= sr:
-        state["turn_direction"] = 1.0
+    global mode
+    global target_heading
+    global turn_direction
+
+    # Turn towards the more open side
+    if sl > sr:
+        turn_direction = 1
     else:
-        state["turn_direction"] = -1.0
+        turn_direction = -1
 
-    state["stop_timer"] = STOP_TIME
-    state["mode"] = "STOP"
+    target_heading = heading + (
+        turn_direction * TURN_ANGLE
+    )
 
-    wall_pid.reset()
-    hold_pid.reset()
+    while target_heading > math.pi:
+        target_heading -= 2 * math.pi
+
+    while target_heading < -math.pi:
+        target_heading += 2 * math.pi
+
+    turn_pid.reset()
+
+    mode = "TURN"
 
 
-# ================= CONTROLLER =================
+# =========================================================
+# CONTROLLER
+# =========================================================
 
-def controller(fl, fr, sl, sr, yaw_rate, dt):
+def controller(fl, fr, sl, sr, gyro_z, dt):
+
+    global mode
+    global heading
+    global target_heading
+    global wall_side
 
     fl = clean(fl)
     fr = clean(fr)
@@ -204,80 +227,60 @@ def controller(fl, fr, sl, sr, yaw_rate, dt):
 
     dt = max(0.001, float(dt))
 
-    # Integrate gyro
-    state["heading"] += yaw_rate * dt
+    # -----------------------------------------------------
+    # Gyro integration
+    # -----------------------------------------------------
 
-    state["heading"] = normalize_angle(
-        state["heading"]
-    )
+    heading += gyro_z * dt
+
+    while heading > math.pi:
+        heading -= 2 * math.pi
+
+    while heading < -math.pi:
+        heading += 2 * math.pi
 
     front = min(fl, fr)
 
-    mode = state["mode"]
-
-    # ==================================================
-    # STOP
-    # ==================================================
-
-    if mode == "STOP":
-
-        state["stop_timer"] -= dt
-
-        if state["stop_timer"] <= 0:
-
-            state["target_heading"] = normalize_angle(
-                state["heading"] +
-                state["turn_direction"] * TURN_ANGLE
-            )
-
-            turn_pid.reset()
-
-            state["mode"] = "TURN"
-
-        return 0.0, 0.0
-
-    # ==================================================
-    # TURN
-    # ==================================================
+    # =====================================================
+    # TURN MODE
+    # =====================================================
 
     if mode == "TURN":
 
-        error = normalize_angle(
-            state["target_heading"] -
-            state["heading"]
+        error = angle_error(
+            target_heading,
+            heading
         )
 
-        if (
-            abs(error) < TURN_TOL and
-            abs(yaw_rate) < 0.25
-        ):
+        # Turn complete
+        if abs(error) < TURN_TOLERANCE:
 
-            state["heading"] = state["target_heading"]
+            mode = "DRIVE"
 
-            state["mode"] = "DRIVE"
-
-            state["wall_side"] = None
+            wall_side = None
 
             wall_pid.reset()
-            hold_pid.reset()
 
             return 0.0, 0.0
 
+        # PID turn
         turn = turn_pid.update(
             error,
             dt
         )
 
-        turn *= state["turn_direction"]
+        # Guarantee enough turning power
+        if abs(turn) < 1.5:
+            turn = 1.5 if error > 0 else -1.5
 
         return (
-            clamp(-turn),
-            clamp(turn)
+            clamp(-turn, -TURN_SPEED, TURN_SPEED),
+            clamp(turn, -TURN_SPEED, TURN_SPEED)
         )
 
-    # ==================================================
+    # =====================================================
     # FRONT WALL
-    # ==================================================
+    # =====================================================
 
     if front <= FRONT_STOP:
 
@@ -285,57 +288,75 @@ def controller(fl, fr, sl, sr, yaw_rate, dt):
 
         return 0.0, 0.0
 
-    # ==================================================
+    # =====================================================
     # SPEED
-    # ==================================================
+    # =====================================================
 
-    speed = speed_from_front(front)
+    speed = get_speed(front)
 
-    # ==================================================
-    # WALL DETECTION
-    # ==================================================
+    # =====================================================
+    # DETECT WALL
+    # =====================================================
 
-    left_wall = sl < OPEN_THRESH
-    right_wall = sr < OPEN_THRESH
+    left_wall = sl < WALL_DETECT
+    right_wall = sr < WALL_DETECT
 
-    # Select wall
+    # -----------------------------------------------------
+    # BOTH WALLS
+    # -----------------------------------------------------
+
     if left_wall and right_wall:
 
         if sl < sr:
-            wall = sl
-            wall_side = "LEFT"
+
+            current_wall = "LEFT"
+            distance = sl
+
         else:
-            wall = sr
-            wall_side = "RIGHT"
+
+            current_wall = "RIGHT"
+            distance = sr
+
+    # -----------------------------------------------------
+    # LEFT WALL
+    # -----------------------------------------------------
 
     elif left_wall:
 
-        wall = sl
-        wall_side = "LEFT"
+        current_wall = "LEFT"
+        distance = sl
+
+    # -----------------------------------------------------
+    # RIGHT WALL
+    # -----------------------------------------------------
 
     elif right_wall:
 
-        wall = sr
-        wall_side = "RIGHT"
+        current_wall = "RIGHT"
+        distance = sr
+
+    # -----------------------------------------------------
+    # NO WALL
+    # -----------------------------------------------------
 
     else:
 
-        wall = None
-        wall_side = None
+        current_wall = None
+        distance = None
 
-    # ==================================================
+    # =====================================================
     # WALL FOLLOWING
-    # ==================================================
+    # =====================================================
 
-    if wall is not None:
+    if current_wall is not None:
 
-        if state["wall_side"] != wall_side:
+        if wall_side != current_wall:
 
             wall_pid.reset()
 
-            state["wall_side"] = wall_side
+            wall_side = current_wall
 
-        error = wall - WALL_TARGET
+        error = distance - WALL_DISTANCE
 
         correction = wall_pid.update(
             error,
@@ -343,45 +364,38 @@ def controller(fl, fr, sl, sr, yaw_rate, dt):
         )
 
         # LEFT WALL
-        if wall_side == "LEFT":
+        if current_wall == "LEFT":
 
-            left_speed = speed - correction
-            right_speed = speed + correction
+            left = speed - correction
+            right = speed + correction
 
         # RIGHT WALL
         else:
 
-            left_speed = speed + correction
-            right_speed = speed - correction
+            left = speed + correction
+            right = speed - correction
 
         return (
-            clamp(left_speed),
-            clamp(right_speed)
+            clamp(left),
+            clamp(right)
         )
 
-    # ==================================================
-    # NO WALL → HOLD HEADING
-    # ==================================================
+    # =====================================================
+    # NO WALL
+    # =====================================================
 
-    state["wall_side"] = None
+    wall_side = None
 
-    error = normalize_angle(
-        state["target_heading"] -
-        state["heading"]
-    )
-
-    correction = hold_pid.update(
-        error,
-        dt
-    )
-
+    # Continue straight
     return (
-        clamp(speed - correction),
-        clamp(speed + correction)
+        clamp(speed),
+        clamp(speed)
     )
 
 
-# ================= MQTT =================
+# =========================================================
+# MQTT
+# =========================================================
 
 def create_client():
 
@@ -394,6 +408,26 @@ def create_client():
     except AttributeError:
 
         return mqtt.Client()
+
+
+def on_connect(
+    client,
+    userdata,
+    flags,
+    reason_code,
+    properties=None
+):
+
+    print("Connected to MQTT")
+
+    client.subscribe(
+        TOPIC_SENSORS
+    )
+
+    print(
+        "Subscribed:",
+        TOPIC_SENSORS
+    )
 
 
 def on_message(client, userdata, msg):
@@ -410,9 +444,7 @@ def on_message(client, userdata, msg):
         sl = data["sl"]
         sr = data["sr"]
 
-        gyro = data["gyro"]
-
-        yaw_rate = gyro[2]
+        gyro_z = data["gyro"][2]
 
         dt = data["dt"]
 
@@ -421,14 +453,12 @@ def on_message(client, userdata, msg):
             fr,
             sl,
             sr,
-            yaw_rate,
+            gyro_z,
             dt
         )
 
         command = {
-
             "left": float(left),
-
             "right": float(right)
         }
 
@@ -439,27 +469,30 @@ def on_message(client, userdata, msg):
 
     except Exception as e:
 
-        print("Controller error:", e)
+        print(
+            "Controller error:",
+            e
+        )
 
 
-# ================= MAIN =================
+# =========================================================
+# MAIN
+# =========================================================
 
 def main():
 
     client = create_client()
 
+    client.on_connect = on_connect
     client.on_message = on_message
+
+    print("Starting PacBot controller...")
 
     client.connect(
         MQTT_HOST,
-        MQTT_PORT
+        MQTT_PORT,
+        60
     )
-
-    client.subscribe(
-        TOPIC_SENSORS
-    )
-
-    print("PacBot controller started")
 
     client.loop_forever()
 
@@ -472,4 +505,4 @@ if __name__ == "__main__":
 
     except KeyboardInterrupt:
 
-        print("\nController stopped")
+        print("Controller stopped")
