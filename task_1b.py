@@ -21,6 +21,7 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
+SWAP_SIDES = True          # True: treat the "sl" sensor as the right side and "sr" as the left
 SPEED_SCALE = 100.0        # overall speed multiplier (was 10.0, now x10)
 BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, top commanded wheel speed
 MAX_WHEEL = 16.0 * SPEED_SCALE     # rad/s, saturation limit
@@ -135,6 +136,8 @@ def _hold_straight(speed, dt):
 def _controller(fl, fr, sl, sr, yaw_rate, dt):
     """Return (left_vel, right_vel) in rad/s."""
     fl, fr, sl, sr = _clean(fl), _clean(fr), _clean(sl), _clean(sr)
+    if SWAP_SIDES:                              # fix for side sensors mounted the other way round
+        sl, sr = sr, sl
     _state["heading"] += yaw_rate * dt          # gyro-integrated heading
 
     front = min(fl, fr)
