@@ -18,13 +18,14 @@ TOPIC_SENSORS = "pacbot/sensors"      # simulator publishes, this file subscribe
 TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribes
 
 # --- Navigation Parameters ---
-MAX_SPEED = 6.0              # Regular cruising speed (rad/s)
-MIN_SPEED = 1.2              # Creep speed as approaching the wall (rad/s)
-TURN_SPEED = 3.5             # In-place turn speed (rad/s)
+MAX_SPEED = 5.5              # Cruising speed (rad/s)
+MIN_SPEED = 1.0              # Slow approach speed (rad/s)
+TURN_SPEED = 3.0             # In-place rotation speed (rad/s)
 
-# Corridor is 0.22m wide; stop halfway before hitting the perpendicular wall
-STOP_DIST = 0.115            # Distance threshold to stop and turn (m)
-SLOW_DIST = 0.28             # Distance threshold to start smooth deceleration (m)
+# Sensor offsets: stopping around 0.055m puts the bot's rotation center
+# directly at the center of the 0.22m cell intersection.
+STOP_DIST = 0.058            # Closer distance to prevent early turns (m)
+SLOW_DIST = 0.220            # Begin smooth deceleration within 1 corridor width (m)
 
 # --- State Machine Tracking ---
 # States: 'MOVE_FORWARD', 'TURNING'
@@ -58,25 +59,25 @@ def on_message(client, userdata, msg):
     right_vel = 0.0
 
     if state == 'MOVE_FORWARD':
-        # Wall is directly ahead: stop and turn towards the open direction
+        # Reached intersection center: initiate turn
         if front_dist <= STOP_DIST:
             accumulated_yaw = 0.0
 
-            # Turn toward whichever side has the wall farthest away
+            # Turn toward whichever side has more clearance
             if sl > sr:
-                # Turn Left (+pi/2)
+                # Turn Left (+90 deg)
                 target_angle = math.pi / 2.0
                 left_vel = -TURN_SPEED
                 right_vel = TURN_SPEED
             else:
-                # Turn Right (-pi/2)
+                # Turn Right (-90 deg)
                 target_angle = -math.pi / 2.0
                 left_vel = TURN_SPEED
                 right_vel = -TURN_SPEED
 
             state = 'TURNING'
         else:
-            # Smooth proportional deceleration to prevent crashing
+            # Proportional braking to reach STOP_DIST gently without ramming
             if front_dist < SLOW_DIST:
                 ratio = (front_dist - STOP_DIST) / (SLOW_DIST - STOP_DIST)
                 ratio = max(0.0, min(1.0, ratio))
@@ -88,10 +89,10 @@ def on_message(client, userdata, msg):
             right_vel = speed
 
     elif state == 'TURNING':
-        # Integrate gyro angular velocity over time
+        # Integrate gyro rate
         accumulated_yaw += yaw_rate * dt
 
-        # Check whether target 90-degree rotation is complete
+        # Complete rotation
         is_turn_done = False
         if target_angle > 0:  # Turning Left
             if accumulated_yaw >= target_angle:
