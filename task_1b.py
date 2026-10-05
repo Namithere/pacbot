@@ -28,11 +28,14 @@ MIN_SPEED = 4.0            # rad/s, creep speed right at the stop distance
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
 WALL_TARGET = 0.05         # m, desired distance to a side wall while driving
-FRONT_STOP = 0.14          # m, front wall closer than this -> brake and turn
+FRONT_STOP = 0.09          # m, front wall closer than this -> brake and turn
 BRAKE_GAIN = 70.0          # rad/s per sqrt(m): bigger = brakes later / harder
 BRAKE_T = 0.06             # s, short reverse pulse to kill momentum before turning
 BRAKE_REV = 0.5            # fraction of the current speed applied in reverse
 OPEN_THRESH = 0.15         # m, a side wall farther than this is ignored (gap)
+
+STARTUP_T = 0.5            # s, at the start: drive forward only, no turning allowed
+START_SPEED = 8.0          # rad/s, speed cap during the start-up window
 
 WALL_KP, WALL_KI, WALL_KD = 80.0, 0.5, 6.0     # wall-distance PID
 TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
@@ -71,6 +74,7 @@ _hold_pid = PID(HOLD_KP, HOLD_KI, HOLD_KD, out_limit=HOLD_MAX, i_limit=1.0)
 # Controller state (module-level so on_message's signature stays untouched)
 _state = {
     "mode": "STRAIGHT", # STRAIGHT -> BRAKE -> TURN -> STRAIGHT ...
+    "t": 0.0,           # s, time since the first message (start-up window)
     "heading": 0.0,     # rad, integrated gyro yaw
     "hold": 0.0,        # rad, heading to hold on straight runs
     "target": 0.0,      # rad, heading goal while TURN
@@ -123,9 +127,11 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     """Return (left_vel, right_vel) in rad/s."""
     fl, fr, sl, sr = _clean(fl), _clean(fr), _clean(sl), _clean(sr)
     _state["heading"] += yaw_rate * dt          # gyro-integrated heading
+    _state["t"] += min(max(dt, 0.0), 0.01)      # start-up clock (bad dt can't skip it)
 
     front = min(fl, fr)
     speed = _approach_speed(front)              # slows early enough to stop in time
+    starting = _state["t"] < STARTUP_T          # start-up window: drive forward only
 
     # ---- TURN: rotate in place using gyro heading ----
     if _state["mode"] == "TURN":
@@ -149,11 +155,16 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
         return _clamp(rev), _clamp(rev)
 
     # ---- STRAIGHT: drive until a wall is detected in front, then brake and turn ----
-    if front < FRONT_STOP:
+    if front < FRONT_STOP and not starting:
         _state["pending"] = math.pi / 2 if sl >= sr else -math.pi / 2
         _state["mode"] = "BRAKE"
         _state["timer"] = BRAKE_T
         return 0.0, 0.0
+
+    if starting:
+        speed = min(speed, START_SPEED)         # gentle, straight launch
+        _state["hold"] = 0.0                    # hold the starting heading
+        return _hold_straight(max(speed, MIN_SPEED), dt)
 
     _state["last_speed"] = speed
 
