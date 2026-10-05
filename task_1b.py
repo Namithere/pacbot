@@ -1,10 +1,12 @@
-"""PB Task 1B - Straight driving, stop at front wall, 90-degree turn toward
-the side with more clearance, and repeat until exit.
+"""Boilerplate for PB Task 1B.
+
+Subscribes to the simulator's sensor topic, logs each reading, and publishes
+a wheel velocity command back. Fill in your control logic where marked.
 
 Run (three terminals):
     mosquitto
     ./task_1b_launch
-    python3 task_1b.py
+    python3 task_1b_boilerplate.py
 """
 import json
 import math
@@ -22,54 +24,48 @@ WHEEL_R = 0.017
 TRACK = 0.092
 
 # ----------------------------------------------------------------------------
-# Tunables
+# Tunables (High-Speed & Active Counter-Braking)
 # ----------------------------------------------------------------------------
-BASE_SPEED = 8.0          # Base forward cruise speed (rad/s)
-MIN_SPEED = 1.2           # Minimum approach crawl speed (rad/s)
+BASE_SPEED = 14.0          # Aggressive forward speed (rad/s)
+MIN_APPROACH_SPEED = 2.0   # Safe approach floor before stop (rad/s)
+REVERSE_PULSE_SPEED = -5.0 # Active counter-torque to immediately cancel linear momentum
 
-# Front wall detection calibrated for 0.22m corridor
-FRONT_STOP = 0.090        # Stop and begin turn sequence below this (m)
-FRONT_EMERGENCY = 0.065   # Instant brake threshold (m)
-SLOW_DIST = 0.280         # Begin proportional deceleration (m)
-FRONT_CONFIRM = 2         # Consecutive readings below FRONT_STOP to trigger brake
-MAX_VALID = 1.0           # Maximum valid sensor distance (m)
+# Collision Avoidance Thresholds
+FRONT_STOP = 0.108         # Trigger active brake to stop at ~0.06m after momentum (m)
+SLOW_DIST = 0.550          # Extended braking window for high speed (m)
+MAX_VALID = 1.0            # Discard non-finite / out-of-range sensor returns (m)
 
-# Gyro heading hold during straight drive
-K_HEAD = 5.0              # Heading proportional correction
-K_GYRO = 0.8              # Heading rate damping
-U_LIMIT = 2.5             # Maximum differential steering adjustment (rad/s)
+# Gyro heading stabilization during drive
+K_HEAD = 7.0
+K_GYRO = 1.2
+U_LIMIT = 4.0
 
-# Wall proximity protection while driving forward
-SIDE_SAFE = 0.050         # Distance buffer from corridor side walls (m)
-K_SIDE = 35.0             # Side repulsion gain
+# Side wall bumper guard
+SIDE_SAFE = 0.052
+K_SIDE = 45.0
 
-# Stop-and-turn parameters
-BRAKE_TIME = 0.15         # Settle time at 0 speed before reading side sensors (s)
-BIAS_TIME = 0.10          # Gyro bias sampling window while stationary (s)
-TURN_RATE_MAX = 2.8       # Maximum angular turn speed (rad/s)
-TURN_RATE_MIN = 0.8       # Minimum angular turn speed (rad/s)
-TURN_KP = 4.0             # Proportional gain for rotation
-TURN_TOL = math.radians(1.5)
-SETTLE_TIME = 0.12        # Settle duration after completing turn (s)
-SETTLE_TOL = math.radians(2.5)
-TURN_ANGLE = math.pi / 2  # 90 degrees (+left, -right)
+# Rotation parameters
+TURN_RATE_MAX = 6.5        # Rapid in-place pivot (rad/s)
+TURN_RATE_MIN = 1.5
+TURN_KP = 8.0
+TURN_TOL = math.radians(2.5)
+TURN_ANGLE = math.pi / 2.0
+
+# Timers
+ACTIVE_BRAKE_TIME = 0.035  # Duration of reverse torque pulse (s)
+SETTLE_TIME = 0.040        # Quick settle before sampling side sensors (s)
 
 # ----------------------------------------------------------------------------
 # State Machine
 # ----------------------------------------------------------------------------
+# States: 'DRIVE', 'ACTIVE_BRAKE', 'SAMPLE_SENSORS', 'TURN'
 state = {
-    "mode": "DRIVE",      # DRIVE -> BRAKE -> TURN -> SETTLE -> DRIVE
-    "t": 0.0,
+    "mode": "DRIVE",
     "t_mode": 0.0,
-    "front_count": 0,
     "heading": 0.0,
     "angle": 0.0,
     "target": 0.0,
     "bias": 0.0,
-    "bias_sum": 0.0,
-    "sl_sum": 0.0,
-    "sr_sum": 0.0,
-    "n": 0,
 }
 
 
@@ -92,19 +88,6 @@ def _mqtt_client():
         return mqtt.Client()
 
 
-def _start_brake():
-    state.update(
-        mode="BRAKE",
-        t_mode=0.0,
-        angle=0.0,
-        front_count=0,
-        bias_sum=0.0,
-        sl_sum=0.0,
-        sr_sum=0.0,
-        n=0
-    )
-
-
 def on_message(client, userdata, msg):
     data = json.loads(msg.payload.decode())
 
@@ -118,10 +101,7 @@ def on_message(client, userdata, msg):
     if dt is None or dt <= 0:
         dt = 0.002
 
-    state["t"] += dt
     rate = yaw_rate - state["bias"]
-
-    # Minimum of valid readings ensures early detection even when approaching at an angle
     front = min(_val(fl), _val(fr))
     mode = state["mode"]
     left_vel = 0.0
@@ -130,35 +110,30 @@ def on_message(client, userdata, msg):
     if mode == "DRIVE":
         state["heading"] += rate * dt
 
-        # Wall detection confirmation
-        if front < FRONT_STOP:
-            state["front_count"] += 1
+        if front <= FRONT_STOP:
+            # Wall reached: trigger active counter-brake to instantly kill forward inertia
+            state["mode"] = "ACTIVE_BRAKE"
+            state["t_mode"] = 0.0
+            left_vel = REVERSE_PULSE_SPEED
+            right_vel = REVERSE_PULSE_SPEED
         else:
-            state["front_count"] = 0
-
-        # Trigger braking on confirmation or emergency proximity
-        if state["front_count"] >= FRONT_CONFIRM or front <= FRONT_EMERGENCY:
-            _start_brake()
-            left_vel = 0.0
-            right_vel = 0.0
-        else:
-            # Proportional deceleration approaching the wall
+            # Smooth progressive deceleration approaching the obstacle
             if front < SLOW_DIST:
-                k = _clamp((front - FRONT_STOP) / (SLOW_DIST - FRONT_STOP), 0.0, 1.0)
-                speed = MIN_SPEED + k * (BASE_SPEED - MIN_SPEED)
+                ratio = (front - FRONT_STOP) / (SLOW_DIST - FRONT_STOP)
+                ratio = max(0.0, min(1.0, ratio))
+                speed = MIN_APPROACH_SPEED + (ratio ** 1.3) * (BASE_SPEED - MIN_APPROACH_SPEED)
             else:
                 speed = BASE_SPEED
 
-            # Heading hold using gyro
+            # Heading hold via gyro
             u = -K_HEAD * state["heading"] - K_GYRO * rate
 
-            # Side clearance push away from side walls
+            # Side clearance repulsion
             push = 0.0
-            if SIDE_SAFE > 0:
-                if _valid(sl) and sl < SIDE_SAFE:
-                    push -= K_SIDE * (SIDE_SAFE - sl)
-                if _valid(sr) and sr < SIDE_SAFE:
-                    push += K_SIDE * (SIDE_SAFE - sr)
+            if _valid(sl) and sl < SIDE_SAFE:
+                push -= K_SIDE * (SIDE_SAFE - sl)
+            if _valid(sr) and sr < SIDE_SAFE:
+                push += K_SIDE * (SIDE_SAFE - sr)
 
             if push != 0.0:
                 state["heading"] = 0.0
@@ -167,57 +142,49 @@ def on_message(client, userdata, msg):
             left_vel = speed - u
             right_vel = speed + u
 
-    elif mode == "BRAKE":
+    elif mode == "ACTIVE_BRAKE":
+        state["t_mode"] += dt
+        left_vel = REVERSE_PULSE_SPEED
+        right_vel = REVERSE_PULSE_SPEED
+
+        # After applying counter-torque pulse, switch to zero-velocity settle
+        if state["t_mode"] >= ACTIVE_BRAKE_TIME:
+            state["mode"] = "SAMPLE_SENSORS"
+            state["t_mode"] = 0.0
+            left_vel = 0.0
+            right_vel = 0.0
+
+    elif mode == "SAMPLE_SENSORS":
+        state["t_mode"] += dt
         left_vel = 0.0
         right_vel = 0.0
-        state["t_mode"] += dt
 
-        # Settle robot and integrate accurate stationary readings
-        if state["t_mode"] >= BRAKE_TIME:
-            state["bias_sum"] += yaw_rate
-            state["sl_sum"] += _val(sl)
-            state["sr_sum"] += _val(sr)
-            state["n"] += 1
+        if state["t_mode"] >= SETTLE_TIME:
+            # Measure side distances while stopped and turn toward the open passage
+            left_space = _val(sl)
+            right_space = _val(sr)
 
-            if state["t_mode"] >= BRAKE_TIME + BIAS_TIME:
-                n = max(state["n"], 1)
-                state["bias"] = state["bias_sum"] / n
-                left_space = state["sl_sum"] / n
-                right_space = state["sr_sum"] / n
-
-                # Turn toward the side with greater open distance
-                state["target"] = TURN_ANGLE if left_space >= right_space else -TURN_ANGLE
-                state["angle"] = 0.0
-                state["mode"] = "TURN"
+            state["target"] = TURN_ANGLE if left_space >= right_space else -TURN_ANGLE
+            state["angle"] = 0.0
+            state["mode"] = "TURN"
 
     elif mode == "TURN":
         state["angle"] += rate * dt
         err = state["target"] - state["angle"]
 
         if abs(err) < TURN_TOL:
-            state.update(mode="SETTLE", t_mode=0.0)
-            left_vel = 0.0
-            right_vel = 0.0
+            # Turn complete: instantly launch back into forward drive
+            state["mode"] = "DRIVE"
+            state["heading"] = 0.0
+            left_vel = BASE_SPEED
+            right_vel = BASE_SPEED
         else:
             w = math.copysign(
                 _clamp(TURN_KP * abs(err), TURN_RATE_MIN, TURN_RATE_MAX),
                 err
             )
-            # In-place differential wheel rotation
             wheel = w * (TRACK / 2.0) / WHEEL_R
             left_vel, right_vel = -wheel, wheel
-
-    elif mode == "SETTLE":
-        state["angle"] += rate * dt
-        state["t_mode"] += dt
-        left_vel = 0.0
-        right_vel = 0.0
-
-        if state["t_mode"] >= SETTLE_TIME:
-            if abs(state["target"] - state["angle"]) > SETTLE_TOL:
-                state["mode"] = "TURN"
-            else:
-                state.update(mode="DRIVE", heading=0.0, front_count=0)
 
     client.publish(TOPIC_WHEEL_VEL, json.dumps({
         "left": float(left_vel), "right": float(right_vel),
