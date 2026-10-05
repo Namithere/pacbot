@@ -1,13 +1,5 @@
 """
-Optimized PB Task 1B Controller.
-
-Subscribes to pacbot/sensors, runs high-speed corridor centering,
-braking, and in-place turns, then publishes back to pacbot/wheel_vel.
-
-Run in separate terminals:
-    mosquitto
-    ./task_1b_launch
-    python3 task_1b_boilerplate.py
+Optimized PB Task 1B Controller - Crash-Proofed High-Speed Version
 """
 
 import json
@@ -23,55 +15,51 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 SWAP_SIDES = True          # True: map "sl" as right, "sr" as left
 
 # --- Tunables ---
-SPEED_SCALE = 2.2          # Aggressive speed multiplier
-_S = SPEED_SCALE
-_G = math.sqrt(_S)
-TURN_SCALE = 2.0           # Turn agility factor
-
-BASE_SPEED = 20.0 * _S     # Fast cruising speed (rad/s)
-MAX_WHEEL = 35.0 * _S      # Saturation ceiling for steering adjustments
-MIN_SPEED = 6.0            # Creep speed when nearing a wall
+BASE_SPEED = 22.0          # Controlled high forward speed (rad/s)
+MAX_WHEEL = 35.0           # Saturation ceiling for steering adjustments
+MIN_SPEED = 5.0            # Creep speed approaching wall
 MAX_RANGE = 2.0            # Default for invalid ToF readings
 
 # --- Wall in front -> stop -> turn ---
-FRONT_STOP = 0.055         # Trigger distance to start braking/stopping (m)
-BACKOFF_DIST = 0.035       # Emergency reverse threshold if too close (m)
-BACKOFF_SPEED = 4.0        # Reverse speed (rad/s)
-BRAKE_MARGIN = 0.07 * _G   # Start slowing down before FRONT_STOP
-BRAKE_K = 140.0 * _S       # Braking curvature
-A_DECEL = 8.0              # Deceleration ceiling before emergency crash guard fires
+# Increased to give adequate braking distance at ~20 rad/s
+FRONT_STOP = 0.11          # m, start turn routine well before mechanical collision
+BACKOFF_DIST = 0.05        # m, emergency reverse threshold
+BACKOFF_SPEED = 6.0        # rad/s, reverse speed
+BRAKE_MARGIN = 0.12        # m, begins deceleration ramp well in advance
+BRAKE_K = 35.0             # Braking curvature: slows smoothly to MIN_SPEED
+A_DECEL = 6.0              # Deceleration ceiling for crash guard
 VEL_WIN = 0.02             # Window for closing speed calculation (s)
-BRAKE_REV = 25.0           # Reverse command during emergency crash intervention
+BRAKE_REV = 20.0           # Reverse command during emergency braking
 
-# --- Minimized Stop Latency ---
-STOP_MIN_T = 0.03          # Minimum wait time at zero speed (s)
-STOP_MAX_T = 0.25          # Maximum settling timeout before forcing turn (s)
-STILL_WIN = 0.02           # Sampling duration for zero-motion check (s)
-STILL_DIST = 0.005         # Distance delta considered stationary (m)
-STILL_YAW = 0.08           # Gyro threshold considered stationary (rad/s)
+# --- Turn Timers ---
+STOP_MIN_T = 0.01          # Minimum pause before turning (s)
+STOP_MAX_T = 0.10          # Cut long timeouts to snap turns immediately
+STILL_WIN = 0.02           # Sampling duration
+STILL_DIST = 0.008         # m
+STILL_YAW = 0.12           # rad/s
 
 # --- Driving between walls ---
 CORRIDOR_W = 0.22
 OPEN_THRESH = 0.20
-CENTER_KP = 130.0 * _G     # Proportional centering gain
-CENTER_KI = 0.5
-CENTER_KD = 10.0 * _G      # Increased D-gain to dampen high-speed oscillation
-HOLD_KP = 8.0 * _G
+CENTER_KP = 85.0           # Centering P-gain
+CENTER_KI = 0.0            # Ki=0 to avoid integral windup at high speeds
+CENTER_KD = 9.0            # D-gain to kill oscillations
+HOLD_KP = 10.0
 HOLD_KI = 0.0
-HOLD_KD = 0.2 * _G
-STEER_MAX = 25.0 * _G      # Maximum steering differential allowed
+HOLD_KD = 0.5
+STEER_MAX = 20.0           # Steering differential limit
 
 # --- Fast In-Place Turning ---
 TURN_ANGLE_DEG = 90.0
-TURN_MAX = 12.0 * TURN_SCALE  # Maximum wheel velocity during turn (rad/s)
-TURN_YAW_MAX = 35.0           # Body angular velocity limit (rad/s)
-TURN_DECEL = 25.0             # Rotational deceleration
-TURN_MARGIN_DEG = 3.5
-TURN_CREEP = 0.8
-TURN_YAW_KP = 12.0
-TURN_TOL = math.radians(3.5)  # Slightly relaxed tolerance for rapid exit
+TURN_MAX = 14.0            # Maximum wheel velocity during turn (rad/s)
+TURN_YAW_MAX = 25.0        # Angular velocity limit
+TURN_DECEL = 20.0          # Rotational deceleration
+TURN_MARGIN_DEG = 4.0
+TURN_CREEP = 1.0
+TURN_YAW_KP = 10.0
+TURN_TOL = math.radians(4.0)
 
-PRINT_EVERY = 50           # Throttled status logs (~10 Hz)
+PRINT_EVERY = 50
 
 
 class PID:
@@ -148,8 +136,11 @@ def _update_closing_speed(front, dt):
 
 
 def _approach_speed(front):
-    d = max(0.0, front - FRONT_STOP - BRAKE_MARGIN)
-    return min(BASE_SPEED, MIN_SPEED + BRAKE_K * math.sqrt(d))
+    # Smooth deceleration ramp starting BRAKE_MARGIN before FRONT_STOP
+    dist_remaining = max(0.0, front - FRONT_STOP)
+    if dist_remaining > BRAKE_MARGIN:
+        return BASE_SPEED
+    return min(BASE_SPEED, MIN_SPEED + BRAKE_K * math.sqrt(dist_remaining))
 
 
 def _turn_command(err, yaw_rate):
@@ -174,12 +165,11 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     _update_closing_speed(front, dt)
     mode = _state["mode"]
 
-    # ---- STOP: rapid settling ----
+    # ---- STOP: Settle and immediately transition to turn ----
     if mode == "STOP":
         _state["stop_t"] += dt
 
         if front < BACKOFF_DIST:
-            _state["win_t"], _state["win_front"], _state["still_n"] = 0.0, front, 0
             return -BACKOFF_SPEED, -BACKOFF_SPEED
 
         _state["win_t"] += dt
@@ -191,16 +181,16 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
                 _state["still_n"] = 0
             _state["win_t"], _state["win_front"] = 0.0, front
 
-        at_rest = _state["still_n"] >= 2 and _state["stop_t"] >= STOP_MIN_T
-        if at_rest or _state["stop_t"] >= STOP_MAX_T:
+        # Transition quickly to eliminate dead time
+        if (_state["still_n"] >= 1 and _state["stop_t"] >= STOP_MIN_T) or _state["stop_t"] >= STOP_MAX_T:
             _state["target"] = _state["heading"] + _state["turn"]
             _set_mode("TURN")
         return 0.0, 0.0
 
-    # ---- TURN: high-rate in-place spin ----
+    # ---- TURN: In-place pivot toward open corridor ----
     if mode == "TURN":
         err = _state["target"] - _state["heading"]
-        if abs(err) < TURN_TOL and abs(yaw_rate) < 0.5:
+        if abs(err) < TURN_TOL and abs(yaw_rate) < 0.8:
             _state["hold"] = _state["target"]
             _hold_pid.reset()
             _center_pid.reset()
@@ -209,20 +199,19 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             return 0.0, 0.0
         return _turn_command(err, yaw_rate)
 
-    # ---- DRIVE: high-speed forward run ----
+    # ---- DRIVE: Forward run with proactive front wall trigger ----
     if front < FRONT_STOP:
         angle = math.radians(TURN_ANGLE_DEG)
         _state["turn"] = angle if sl >= sr else -angle
         _state.update(stop_t=0.0, win_t=0.0, win_front=front, still_n=0)
         _set_mode("STOP")
-        return 0.0, 0.0
+        # Apply active counter-torque immediately to stop forward momentum
+        return -BACKOFF_SPEED, -BACKOFF_SPEED
 
-    # Crash guard with expanded deceleration headroom
+    # Active crash guard: If speed toward wall is too high, actively brake
     v_safe = math.sqrt(2.0 * A_DECEL * max(0.0, front - FRONT_STOP))
     if _state["v_close"] > v_safe:
-        if _state["v_close"] > 1.4 * v_safe:
-            return -BRAKE_REV, -BRAKE_REV
-        return 0.0, 0.0
+        return -BRAKE_REV, -BRAKE_REV
 
     speed = _approach_speed(front)
 
@@ -265,7 +254,6 @@ def on_message(client, userdata, msg):
 
     _log(data["fl"], data["fr"], data["sl"], data["sr"], yaw_rate, dt, left_vel, right_vel)
 
-    # Direct string formatting avoids JSON serialization latency
     payload = f'{{"left":{float(left_vel):.3f},"right":{float(right_vel):.3f}}}'
     client.publish(TOPIC_WHEEL_VEL, payload, qos=0)
 
