@@ -26,33 +26,36 @@ TRACK = 0.092
 # ----------------------------------------------------------------------------
 # Tunables
 # ----------------------------------------------------------------------------
-BASE_SPEED = 12.0          # High cruise speed (rad/s)
-MIN_APPROACH_SPEED = 1.8   # Approach crawl floor (rad/s)
+BASE_SPEED = 10.0          # Controlled high speed (rad/s)
+MIN_APPROACH_SPEED = 1.5   # Creep floor near walls (rad/s)
 
-# Stopping thresholds (calibrated for 0.22m corridor with front bumper offset)
-FRONT_STOP = 0.090         # Stop and turn distance (m)
-SLOW_DIST = 0.400          # Distance to begin progressive braking (m)
+# Distance thresholds
+FRONT_STOP = 0.092         # Confirmed stopping distance (m)
+SLOW_DIST = 0.350          # Deceleration start distance (m)
+CONFIRM_FRAMES = 3         # Consecutive frames below FRONT_STOP to prevent startup spins
 
-# Gyro heading lock (prevents drifting or spinning while moving forward)
-K_HEAD = 4.0               # Proportional heading correction
-K_GYRO = 0.6               # Damping on yaw rate
-U_LIMIT = 2.0              # Max steering correction (rad/s)
-
-# Turn tunables
-TURN_RATE_MAX = 5.0        # Rapid rotation body rate (rad/s)
-TURN_RATE_MIN = 1.0        # Creep turn speed for precise landing (rad/s)
-TURN_KP = 6.0              # Turn P-gain
+# Turn parameters
+TURN_RATE_MAX = 4.5        # Fast in-place rotation body rate (rad/s)
+TURN_RATE_MIN = 1.0        # Landing crawl rate (rad/s)
+TURN_KP = 6.0              # Proportional gain
 TURN_TOL = math.radians(2.0)
 TURN_ANGLE = math.pi / 2.0 # 90 degrees
+
+# Heading hold gains
+K_HEAD = 4.0
+K_GYRO = 0.7
+U_LIMIT = 2.5
 
 # ----------------------------------------------------------------------------
 # State Machine
 # ----------------------------------------------------------------------------
-# Modes: 'DRIVE', 'STOP_AND_DECIDE', 'TURN'
+# Modes: 'DRIVE', 'ACTIVE_BRAKE', 'SAMPLE_AND_DECIDE', 'TURN'
 mode = 'DRIVE'
 accumulated_yaw = 0.0
 target_angle = 0.0
-stop_timer = 0
+front_hit_counter = 0
+brake_timer = 0
+settle_timer = 0
 
 
 def _mqtt_client():
@@ -63,7 +66,8 @@ def _mqtt_client():
 
 
 def on_message(client, userdata, msg):
-    global mode, accumulated_yaw, target_angle, stop_timer
+    global mode, accumulated_yaw, target_angle
+    global front_hit_counter, brake_timer, settle_timer
 
     data = json.loads(msg.payload.decode())
 
@@ -79,45 +83,64 @@ def on_message(client, userdata, msg):
     right_vel = 0.0
 
     if mode == 'DRIVE':
-        # Integrate heading to hold a straight line
+        # Track heading to hold a straight line
         accumulated_yaw += yaw_rate * dt
 
+        # Require sustained wall detection across multiple frames
         if front_dist <= FRONT_STOP:
-            # Wall detected: cut speed immediately to settle
-            mode = 'STOP_AND_DECIDE'
-            stop_timer = 0
-            left_vel = 0.0
-            right_vel = 0.0
+            front_hit_counter += 1
         else:
-            # Progressive deceleration as robot approaches the wall
+            front_hit_counter = 0
+
+        if front_hit_counter >= CONFIRM_FRAMES:
+            # Switch to active counter-torque to immediately stop momentum
+            mode = 'ACTIVE_BRAKE'
+            brake_timer = 0
+            front_hit_counter = 0
+            left_vel = -3.5
+            right_vel = -3.5
+        else:
+            # Progressive smooth deceleration approaching the wall
             if front_dist < SLOW_DIST:
                 ratio = (front_dist - FRONT_STOP) / (SLOW_DIST - FRONT_STOP)
                 ratio = max(0.0, min(1.0, ratio))
-                speed = MIN_APPROACH_SPEED + (ratio ** 1.2) * (BASE_SPEED - MIN_APPROACH_SPEED)
+                speed = MIN_APPROACH_SPEED + (ratio ** 1.3) * (BASE_SPEED - MIN_APPROACH_SPEED)
             else:
                 speed = BASE_SPEED
 
-            # Active heading hold along the straight axis
+            # Steer straight using gyro heading hold
             steering = (-K_HEAD * accumulated_yaw) - (K_GYRO * yaw_rate)
             steering = max(-U_LIMIT, min(U_LIMIT, steering))
 
             left_vel = speed - steering
             right_vel = speed + steering
 
-    elif mode == 'STOP_AND_DECIDE':
-        # Hold zero speed for ~20ms to kill linear momentum and settle sensor readings
+    elif mode == 'ACTIVE_BRAKE':
+        # Apply reverse torque for ~25ms to kill forward skid
+        left_vel = -3.5
+        right_vel = -3.5
+        brake_timer += 1
+
+        if brake_timer >= 6:
+            mode = 'SAMPLE_AND_DECIDE'
+            settle_timer = 0
+            left_vel = 0.0
+            right_vel = 0.0
+
+    elif mode == 'SAMPLE_AND_DECIDE':
+        # Hold stationary for a clean sensor sample
         left_vel = 0.0
         right_vel = 0.0
-        stop_timer += 1
+        settle_timer += 1
 
-        if stop_timer >= 10:
+        if settle_timer >= 6:
             accumulated_yaw = 0.0
 
-            # Turn toward whichever side has greater open distance
+            # Select the direction with more clearance
             if sl >= sr:
-                target_angle = TURN_ANGLE      # Turn Left (+90 deg)
+                target_angle = TURN_ANGLE      # Left (+90 deg)
             else:
-                target_angle = -TURN_ANGLE     # Turn Right (-90 deg)
+                target_angle = -TURN_ANGLE     # Right (-90 deg)
 
             mode = 'TURN'
 
@@ -126,9 +149,10 @@ def on_message(client, userdata, msg):
         err = target_angle - accumulated_yaw
 
         if abs(err) <= TURN_TOL:
-            # Turn completed: reset heading tracker and resume high-speed drive
+            # Reset heading and drive straight into the open path
             accumulated_yaw = 0.0
             mode = 'DRIVE'
+            front_hit_counter = 0
             left_vel = BASE_SPEED
             right_vel = BASE_SPEED
         else:
@@ -136,7 +160,6 @@ def on_message(client, userdata, msg):
                 max(TURN_RATE_MIN, min(TURN_RATE_MAX, TURN_KP * abs(err))),
                 err
             )
-            # In-place rotation calculation
             wheel_speed = w * (TRACK / 2.0) / WHEEL_R
             left_vel = -wheel_speed
             right_vel = wheel_speed
