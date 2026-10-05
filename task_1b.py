@@ -1,88 +1,122 @@
-"""
-Complete PB Task 1B Controller.
+"""Boilerplate for PB Task 1B.
 
-Subscribes to pacbot/sensors, drives forward with proportional wall centering,
-decelerates smoothly, and pivots immediately in place when reaching FRONT_STOP (0.09m).
+Subscribes to the simulator's sensor topic, logs each reading, and publishes
+a wheel velocity command back. Fill in your control logic where marked.
 
-Run in separate terminals:
+Run (three terminals):
     mosquitto
     ./task_1b_launch
     python3 task_1b_boilerplate.py
 """
-
 import json
 import math
+
 import paho.mqtt.client as mqtt
 
-# ----------------- MQTT BROKER SETTINGS -----------------
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-TOPIC_SENSORS = "pacbot/sensors"
-TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
+TOPIC_SENSORS = "pacbot/sensors"      # simulator publishes, this file subscribes
+TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribes
 
-# ======================= CONTROLLER SETUP =======================
-SWAP_SIDES = True          # True: map "sl" as right, "sr" as left
 
-# --- Speed & Saturation Limits ---
-BASE_SPEED = 14.0          # Safe, fast cruising velocity (rad/s)
-MAX_WHEEL = 25.0           # Saturation ceiling for steering adjustments
-MIN_SPEED = 4.0            # Creep speed when closing in on a wall
-MAX_RANGE = 2.0            # Default value for ray misses or invalid ToF
+# ======================= YOUR CODE: CONTROLLER SETUP =======================
+# --- Tunables (adjust after watching a few runs) ---
+SWAP_SIDES = True          # True: treat the "sl" sensor as the right side and "sr" as the left
 
-# --- Wall Detection & Braking ---
-FRONT_STOP = 0.09          # Desired turn threshold (9 cm)
-BRAKE_DIST = 0.20          # Start slowing down proportionally at 20 cm
+# One knob for forward speed. Everything marked [scaled] is derived from it.
+SPEED_SCALE = 10000.0      # forward speed multiplier
+_S = SPEED_SCALE / 100.0   # factor relative to the earlier version (100.0 -> 1.0)
+_G = math.sqrt(_S)         # gains scale with sqrt(speed): same correction per metre travelled
 
-# --- Fast In-Place Turning ---
-TURN_ANGLE_DEG = 90.0
-TURN_SPEED = 8.5           # Wheel speed during in-place spin (rad/s)
-TURN_TOL = math.radians(3.5)
+# One knob for the wheel-speed LIMIT during turns (the turn itself is yaw-rate controlled).
+TURN_SCALE = 100.0
 
-# --- Corridor Centering ---
-CORRIDOR_W = 0.22
-OPEN_THRESH = 0.18
-CENTER_KP = 75.0           # Proportional centering gain
-CENTER_KD = 8.0            # Derivative gain to damp oscillation
-HOLD_KP = 8.0
-HOLD_KD = 0.4
-STEER_MAX = 18.0           # Steering differential limit
+BASE_SPEED = 10.0 * SPEED_SCALE    # [scaled] rad/s, top commanded wheel speed
+MAX_WHEEL = 16.0 * SPEED_SCALE     # [scaled] rad/s, saturation limit
+MIN_SPEED = 4.0            # rad/s, creep speed at the end of the braking ramp (kept low on purpose)
+MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
-PRINT_EVERY = 50           # Throttled console logging interval
+CORRIDOR_W = 0.22          # m, distance between the two walls
+OPEN_THRESH = 0.20         # m, a side reading above this means no wall on that side
+FRONT_STOP = 0.06          # m, front wall closer than this -> stop, then turn
+BRAKE_MARGIN = 0.04 * _G   # [scaled] m, braking ramp reaches MIN_SPEED this far before FRONT_STOP
+BRAKE_K = 100.0 * _S       # [scaled] rad/s per sqrt(m): allowed speed = MIN_SPEED + K*sqrt(distance)
+BACKOFF_DIST = 0.045       # m, if the bot overshoots closer than this, it reverses gently
+BACKOFF_SPEED = 3.0        # rad/s, reverse speed used for backing off
+
+# --- Crash guard (uses the bot's MEASURED closing speed, not the command) ---
+A_DECEL = 4.0              # m/s^2, braking you trust the bot to achieve. Lower = safer.
+VEL_WIN = 0.02             # s, window used to measure closing speed from the front ToF
+BRAKE_REV = 20.0           # rad/s, reverse command used when the guard has to brake hard
+
+STOP_MIN_T = 0.10          # s, minimum time held at zero before a turn may start
+STOP_MAX_T = 1.00          # s, give up waiting for "fully stopped" after this long
+STILL_WIN = 0.05           # s, window used to check the front distance has stopped changing
+STILL_DIST = 0.003         # m, front moved less than this in a window -> counts as still
+STILL_YAW = 0.05           # rad/s, gyro rate below this -> not rotating
+
+CENTER_KP, CENTER_KI, CENTER_KD = 120.0 * _G, 0.5, 8.0 * _G   # [scaled] centring PID (error in m)
+HOLD_KP, HOLD_KI, HOLD_KD = 8.0 * _G, 0.0, 0.2 * _G           # [scaled] heading PID (straight hold)
+STEER_MAX = 20.0 * _G      # [scaled] rad/s, max differential from centring / heading hold
+
+# --- Turning (in-place, controlled on the MEASURED yaw rate from the gyro) ---
+TURN_ANGLE_DEG = 90.0      # deg, size of each turn. If it still ends up past 90, try 85.
+TURN_MAX = 6.0 * TURN_SCALE    # [turn-scaled] rad/s, wheel-speed limit during turns
+TURN_YAW_MAX = 20.0        # rad/s, fastest body spin allowed (the real top turn speed)
+TURN_DECEL = 15.0          # rad/s^2, spin-down the bot can really achieve. LOWER = safer.
+TURN_MARGIN_DEG = 3.0      # deg, spin has reached ~0 this far before the target
+TURN_CREEP = 0.5           # rad/s, slow final creep so the last degrees still finish
+TURN_YAW_KP = 8.0          # wheel rad/s per rad/s of yaw-rate error
+TURN_TOL = math.radians(2.0)   # rad, heading error considered "done"
+
+PRINT_EVERY = 50           # print one line every N sensor messages (~10 Hz at 500 Hz)
 
 
 class PID:
-    def __init__(self, kp, ki, kd, out_limit):
+    def __init__(self, kp, ki, kd, out_limit, i_limit=None):
         self.kp, self.ki, self.kd = kp, ki, kd
         self.out_limit = out_limit
+        self.i_limit = i_limit if i_limit is not None else out_limit
         self.reset()
 
     def reset(self):
+        self.integral = 0.0
         self.prev_err = None
 
     def update(self, err, dt):
         if dt <= 0.0:
             return 0.0
+        self.integral += err * dt
+        self.integral = max(-self.i_limit, min(self.i_limit, self.integral))
         deriv = 0.0 if self.prev_err is None else (err - self.prev_err) / dt
         self.prev_err = err
-        out = self.kp * err + self.kd * deriv
+        out = self.kp * err + self.ki * self.integral + self.kd * deriv
         return max(-self.out_limit, min(self.out_limit, out))
 
 
-_center_pid = PID(CENTER_KP, 0.0, CENTER_KD, out_limit=STEER_MAX)
-_hold_pid = PID(HOLD_KP, 0.0, HOLD_KD, out_limit=STEER_MAX)
+_center_pid = PID(CENTER_KP, CENTER_KI, CENTER_KD, out_limit=STEER_MAX, i_limit=0.5)
+_hold_pid = PID(HOLD_KP, HOLD_KI, HOLD_KD, out_limit=STEER_MAX, i_limit=1.0)
 
+# Controller state (module-level so on_message's signature stays untouched)
 _state = {
-    "mode": "DRIVE",
-    "heading": 0.0,
-    "hold": 0.0,
-    "target": 0.0,
-    "turn": 0.0,
-    "total_t": 0.0,        # Startup guard to prevent t=0 false triggers
-    "count": 0,
+    "mode": "STRAIGHT", # STRAIGHT -> STOP -> TURN -> STRAIGHT ...
+    "heading": 0.0,     # rad, integrated gyro yaw
+    "hold": 0.0,        # rad, heading to hold on straight runs
+    "target": 0.0,      # rad, heading goal while TURN
+    "turn": 0.0,        # rad, turn chosen when the stop began (+ = left)
+    "stop_t": 0.0,      # s, time spent in STOP
+    "win_t": 0.0,       # s, time inside the current "is it still?" window
+    "win_front": 0.0,   # m, front reading at the start of the window
+    "still_n": 0,       # consecutive still windows
+    "v_t": 0.0,         # s, time inside the current closing-speed window
+    "v_front": None,    # m, front reading at the start of the closing-speed window
+    "v_close": 0.0,     # m/s, measured closing speed toward the front wall (+ = approaching)
+    "count": 0,         # sensor messages seen (for throttled printing)
 }
 
 
 def _clean(x):
+    """Replace NaN / inf / negative ToF values with MAX_RANGE."""
     try:
         x = float(x)
     except (TypeError, ValueError):
@@ -98,82 +132,150 @@ def _clamp(v):
 
 def _set_mode(new_mode):
     if new_mode != _state["mode"]:
-        print(f"[MODE] {_state['mode']} -> {new_mode} | Heading: {math.degrees(_state['heading']):+.1f}°")
+        print(f"[mode] {_state['mode']} -> {new_mode}  "
+              f"heading={math.degrees(_state['heading']):+.1f} deg")
         _state["mode"] = new_mode
 
 
-def _controller(fl, fr, sl, sr, yaw_rate, dt):
-    fl, fr, sl, sr = _clean(fl), _clean(fr), _clean(sl), _clean(sr)
-    if SWAP_SIDES:
-        sl, sr = sr, sl
+def _update_closing_speed(front, dt):
+    """Measure how fast the bot is closing on the front wall (m/s) from the ToF."""
+    if _state["v_front"] is None:
+        _state["v_front"] = front
+    _state["v_t"] += dt
+    if _state["v_t"] >= VEL_WIN:
+        raw = (_state["v_front"] - front) / _state["v_t"]
+        _state["v_close"] = 0.5 * _state["v_close"] + 0.5 * raw     # light smoothing
+        _state["v_front"], _state["v_t"] = front, 0.0
 
-    _state["heading"] += yaw_rate * dt
-    _state["total_t"] += dt
+
+def _approach_speed(front):
+    """Speed allowed at this front distance (constant-deceleration braking curve).
+
+    allowed = MIN_SPEED + BRAKE_K * sqrt(distance left before the stop point),
+    capped at BASE_SPEED. So the bot is already at creep speed when it reaches
+    FRONT_STOP + BRAKE_MARGIN, however high SPEED_SCALE is.
+    """
+    d = max(0.0, front - FRONT_STOP - BRAKE_MARGIN)
+    return min(BASE_SPEED, MIN_SPEED + BRAKE_K * math.sqrt(d))
+
+
+def _hold_straight(speed, dt):
+    """Drive at `speed` while holding the stored heading using the gyro."""
+    err = _state["hold"] - _state["heading"]
+    w = _hold_pid.update(err, dt)               # + = steer left
+    return _clamp(speed - w), _clamp(speed + w)
+
+
+def _turn_command(err, yaw_rate):
+    """Wheel command (in-place spin) that tracks a yaw-rate profile ending at err = 0.
+
+    The yaw rate we WANT at this angle error is sqrt(2 * TURN_DECEL * (angle left)),
+    capped at TURN_YAW_MAX. If the measured spin is faster than that, the error term
+    goes negative and the wheels reverse, i.e. the bot brakes by itself.
+    """
+    margin = math.radians(TURN_MARGIN_DEG)
+    if abs(err) < TURN_TOL:
+        w_des = 0.0                             # in tolerance: bring the spin to zero
+    else:
+        speed = math.sqrt(2.0 * TURN_DECEL * max(0.0, abs(err) - margin))
+        speed = min(TURN_YAW_MAX, speed + TURN_CREEP)
+        w_des = math.copysign(speed, err)       # + = turn left
+    w = TURN_YAW_KP * (w_des - yaw_rate)        # + = left
+    w = max(-TURN_MAX, min(TURN_MAX, w))
+    return _clamp(-w), _clamp(w)
+
+
+def _controller(fl, fr, sl, sr, yaw_rate, dt):
+    """Return (left_vel, right_vel) in rad/s."""
+    fl, fr, sl, sr = _clean(fl), _clean(fr), _clean(sl), _clean(sr)
+    if SWAP_SIDES:                              # fix for side sensors mounted the other way round
+        sl, sr = sr, sl
+    _state["heading"] += yaw_rate * dt          # gyro-integrated heading
+
     front = min(fl, fr)
+    _update_closing_speed(front, dt)
     mode = _state["mode"]
 
-    # ---------------- 1. DRIVE MODE ----------------
-    if mode == "DRIVE":
-        # Ignore false wall hits in the first 0.15s of simulation initialization
-        if front <= FRONT_STOP and _state["total_t"] > 0.15:
-            angle = math.radians(TURN_ANGLE_DEG)
-            # Turn toward whichever side has more clearance
-            turn_dir = 1.0 if sl >= sr else -1.0
-            _state["turn"] = turn_dir * angle
+    # ---- STOP: wheels at zero; only turn once the bot is really at rest ----
+    if mode == "STOP":
+        _state["stop_t"] += dt
+
+        if front < BACKOFF_DIST:                # overshot the stop point -> back off gently
+            _state["win_t"], _state["win_front"], _state["still_n"] = 0.0, front, 0
+            return -BACKOFF_SPEED, -BACKOFF_SPEED
+
+        _state["win_t"] += dt
+        if _state["win_t"] >= STILL_WIN:        # has the front reading stopped changing?
+            moved = abs(front - _state["win_front"])
+            if moved < STILL_DIST and abs(yaw_rate) < STILL_YAW:
+                _state["still_n"] += 1
+            else:
+                _state["still_n"] = 0
+            _state["win_t"], _state["win_front"] = 0.0, front
+
+        at_rest = _state["still_n"] >= 2 and _state["stop_t"] >= STOP_MIN_T
+        if at_rest or _state["stop_t"] >= STOP_MAX_T:
             _state["target"] = _state["heading"] + _state["turn"]
-
-            print(f"[WALL DETECTED] front={front:.3f}m | sl={sl:.3f}m sr={sr:.3f}m -> Turning {'LEFT' if turn_dir > 0 else 'RIGHT'}")
             _set_mode("TURN")
-            # Apply active differential spin immediately
-            return _clamp(-turn_dir * TURN_SPEED), _clamp(turn_dir * TURN_SPEED)
+        return 0.0, 0.0
 
-        # Proportional speed reduction between BRAKE_DIST and FRONT_STOP
-        if front < BRAKE_DIST:
-            ratio = max(0.0, (front - FRONT_STOP) / (BRAKE_DIST - FRONT_STOP))
-            speed = MIN_SPEED + (BASE_SPEED - MIN_SPEED) * ratio
-        else:
-            speed = BASE_SPEED
-
-        # Corridor centering: walls present on both sides
-        if sl < OPEN_THRESH and sr < OPEN_THRESH:
-            _state["hold"] = _state["heading"]
-            u = _center_pid.update(0.5 * (sl - sr), dt)
-            return _clamp(speed - u), _clamp(speed + u)
-
-        # One or both sides open: lock gyro heading straight
-        _center_pid.reset()
-        w = _hold_pid.update(_state["hold"] - _state["heading"], dt)
-        return _clamp(speed - w), _clamp(speed + w)
-
-    # ---------------- 2. TURN MODE ----------------
+    # ---- TURN: rotate in place, tracking a yaw-rate profile that ends at the target ----
     if mode == "TURN":
         err = _state["target"] - _state["heading"]
-
-        # Turn completion check
-        if abs(err) < TURN_TOL:
-            print(f"[TURN DONE] Exiting turn at {math.degrees(_state['heading']):.1f}°")
-            _state["hold"] = _state["target"]
-            _center_pid.reset()
+        if abs(err) < TURN_TOL and abs(yaw_rate) < 0.3:
+            _state["hold"] = _state["target"]   # new straight-line reference
             _hold_pid.reset()
-            _set_mode("DRIVE")
+            _center_pid.reset()
+            _state["v_front"], _state["v_close"] = None, 0.0
+            _set_mode("STRAIGHT")               # resume driving forward
             return 0.0, 0.0
+        return _turn_command(err, yaw_rate)
 
-        # Pivot in place until heading matches target
-        direction = math.copysign(1.0, err)
-        return _clamp(-direction * TURN_SPEED), _clamp(direction * TURN_SPEED)
+    # ---- STRAIGHT: drive until the wall is FRONT_STOP away, then stop (and turn) ----
+    if front < FRONT_STOP:
+        angle = math.radians(TURN_ANGLE_DEG)
+        _state["turn"] = angle if sl >= sr else -angle               # toward the open side
+        _state.update(stop_t=0.0, win_t=0.0, win_front=front, still_n=0)
+        _set_mode("STOP")
+        return 0.0, 0.0
 
-    return 0.0, 0.0
+    # Crash guard: if the MEASURED closing speed is more than the bot could shed
+    # (at A_DECEL) before FRONT_STOP, stop driving and brake, whatever the ramp says.
+    v_safe = math.sqrt(2.0 * A_DECEL * max(0.0, front - FRONT_STOP))
+    if _state["v_close"] > v_safe:
+        if _state["v_close"] > 1.5 * v_safe:
+            return -BRAKE_REV, -BRAKE_REV       # well over the safe speed: reverse to brake hard
+        return 0.0, 0.0                         # slightly over: cut the drive
+
+    speed = _approach_speed(front)              # brakes automatically near walls
+
+    left_ok, right_ok = sl < OPEN_THRESH, sr < OPEN_THRESH
+    if left_ok and right_ok:
+        # Walls on both sides: stay centred in the 0.22 m corridor.
+        _state["hold"] = _state["heading"]      # keep hold-heading current for hand-over
+        err = 0.5 * (sl - sr)                   # + = closer to the right wall
+        u = _center_pid.update(err, dt)         # + = steer left
+        return _clamp(speed - u), _clamp(speed + u)
+
+    # Gap on one (or both) sides: ignore it, hold the gyro heading straight past it.
+    _center_pid.reset()
+    return _hold_straight(speed, dt)
 
 
 def _log(fl, fr, sl, sr, yaw_rate, dt, left_vel, right_vel):
+    """Throttled status line (one per PRINT_EVERY sensor messages)."""
     _state["count"] += 1
     if _state["count"] % PRINT_EVERY == 0:
         front = min(_clean(fl), _clean(fr))
-        print(f"{_state['mode']:<5} front={front:.3f} sl={_clean(sl):.3f} sr={_clean(sr):.3f} "
-              f"L={left_vel:+.1f} R={right_vel:+.1f} hdg={math.degrees(_state['heading']):+.1f}°")
+        print(f"{_state['mode']:<8} front={front:.3f} sl={_clean(sl):.3f} sr={_clean(sr):.3f} "
+              f"v={_state['v_close']:+.2f}m/s yaw={yaw_rate:+.2f}rad/s "
+              f"cmd L={left_vel:+.1f} R={right_vel:+.1f} "
+              f"hdg={math.degrees(_state['heading']):+.1f}deg")
+# ===========================================================================
 
 
 def _mqtt_client():
+    # paho-mqtt >= 2.0 requires picking a callback API version explicitly.
     try:
         return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except AttributeError:
@@ -183,25 +285,29 @@ def _mqtt_client():
 def on_message(client, userdata, msg):
     data = json.loads(msg.payload.decode())
 
-    yaw_rate = data["gyro"][2]
-    dt = data["dt"]
+    fl = data["fl"]            # Front-left ToF distance readings
+    fr = data["fr"]            # Front-right ToF distance readings
+    sl = data["sl"]            # Side-left ToF distance readings
+    sr = data["sr"]            # Side-right ToF distance readings
+    yaw_rate = data["gyro"][2]  # rad/s about z
+    dt = data["dt"]            # s, simulator timestep
 
-    left_vel, right_vel = _controller(
-        data["fl"], data["fr"], data["sl"], data["sr"], yaw_rate, dt
-    )
+    # Compute wheel velocities (rad/s) from the readings above.
+    left_vel, right_vel = _controller(fl, fr, sl, sr, yaw_rate, dt)
 
-    _log(data["fl"], data["fr"], data["sl"], data["sr"], yaw_rate, dt, left_vel, right_vel)
+    # Printing is throttled to ~10 Hz (and on every mode change) so it doesn't slow the loop.
+    _log(fl, fr, sl, sr, yaw_rate, dt, left_vel, right_vel)
 
-    # Fast direct JSON string formatting
-    payload = f'{{"left":{float(left_vel):.3f},"right":{float(right_vel):.3f}}}'
-    client.publish(TOPIC_WHEEL_VEL, payload, qos=0)
+    client.publish(TOPIC_WHEEL_VEL, json.dumps({
+        "left": float(left_vel), "right": float(right_vel),
+    }))
 
 
 def main():
     client = _mqtt_client()
     client.on_message = on_message
     client.connect(MQTT_HOST, MQTT_PORT)
-    client.subscribe(TOPIC_SENSORS, qos=0)
+    client.subscribe(TOPIC_SENSORS)
     client.loop_forever()
 
 
