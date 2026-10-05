@@ -24,9 +24,12 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 SWAP_SIDES = True          # True: treat the "sl" sensor as the right side and "sr" as the left
 
 # One knob for forward speed. Everything marked [scaled] is derived from it.
-SPEED_SCALE = 10000.0      # was 100.0 -> now x100
-_S = SPEED_SCALE / 100.0   # factor relative to the previous version (100.0 -> 1.0)
+SPEED_SCALE = 10000.0      # forward speed multiplier
+_S = SPEED_SCALE / 100.0   # factor relative to the earlier version (100.0 -> 1.0)
 _G = math.sqrt(_S)         # gains scale with sqrt(speed): same correction per metre travelled
+
+# One knob for turning speed (in-place spins).
+TURN_SCALE = 100.0         # NEW: turning speed multiplier (x100 vs. before)
 
 BASE_SPEED = 10.0 * SPEED_SCALE    # [scaled] rad/s, top commanded wheel speed
 MAX_WHEEL = 16.0 * SPEED_SCALE     # [scaled] rad/s, saturation limit
@@ -56,14 +59,18 @@ CENTER_KP, CENTER_KI, CENTER_KD = 120.0 * _G, 0.5, 8.0 * _G   # [scaled] centrin
 HOLD_KP, HOLD_KI, HOLD_KD = 8.0 * _G, 0.0, 0.2 * _G           # [scaled] heading PID (straight hold)
 STEER_MAX = 20.0 * _G      # [scaled] rad/s, max differential from centring / heading hold
 
-# --- Turning (in-place, deliberately NOT scaled: fast spins overshoot) ---
+# --- Turning (in-place) ---
 TURN_ANGLE_DEG = 90.0      # deg, size of each turn. If it still ends up past 90, try 85.
-TURN_KP, TURN_KI, TURN_KD = 6.0, 0.0, 0.8   # heading PID (turns)
-TURN_MAX = 6.0             # rad/s, top wheel speed during in-place turns
-TURN_MIN = 0.8             # rad/s, floor so the final degrees still finish
-TURN_SLOW_K = 6.0          # rad/s per sqrt(rad): turn speed falls off near the target
+TURN_KP, TURN_KI, TURN_KD = 6.0 * TURN_SCALE, 0.0, 0.8 * TURN_SCALE   # [turn-scaled] heading PID
+TURN_MAX = 6.0 * TURN_SCALE        # [turn-scaled] rad/s, top wheel speed during in-place turns
+TURN_MIN = 0.8             # rad/s, floor so the final degrees still finish (kept low on purpose)
+TURN_SLOW_K = 6.0 * TURN_SCALE     # [turn-scaled] rad/s per sqrt(rad): speed falls off near target
 TURN_LEAD_T = 0.06         # s, look-ahead: brake for where the bot WILL be in this long
 TURN_TOL = math.radians(2.0)   # rad, heading error considered "done"
+
+# --- Turn overshoot guard (uses the MEASURED yaw rate from the gyro) ---
+TURN_DECEL = 40.0          # rad/s^2, spin-down the bot can really achieve. Lower = safer.
+TURN_BRAKE_FRAC = 0.5      # fraction of TURN_MAX applied in reverse when spinning too fast
 
 PRINT_EVERY = 50           # print one line every N sensor messages (~10 Hz at 500 Hz)
 
@@ -208,6 +215,15 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             _state["v_front"], _state["v_close"] = None, 0.0
             _set_mode("STRAIGHT")               # resume driving forward
             return 0.0, 0.0
+
+        # Overshoot guard: if the MEASURED spin is faster than the bot could shed (at
+        # TURN_DECEL) over the angle left, brake with a reverse spin, whatever the PID says.
+        w_safe = math.sqrt(2.0 * TURN_DECEL * abs(err))
+        moving_toward = yaw_rate * err > 0.0
+        if moving_toward and abs(yaw_rate) > w_safe:
+            w = -math.copysign(TURN_BRAKE_FRAC * TURN_MAX, yaw_rate)
+            return _clamp(-w), _clamp(w)
+
         pred_err = err - yaw_rate * TURN_LEAD_T         # where the error will be shortly
         w = _turn_pid.update(pred_err, dt)              # + = turn left
         w_max = min(TURN_MAX, TURN_MIN + TURN_SLOW_K * math.sqrt(abs(err)))
@@ -251,7 +267,8 @@ def _log(fl, fr, sl, sr, yaw_rate, dt, left_vel, right_vel):
     if _state["count"] % PRINT_EVERY == 0:
         front = min(_clean(fl), _clean(fr))
         print(f"{_state['mode']:<8} front={front:.3f} sl={_clean(sl):.3f} sr={_clean(sr):.3f} "
-              f"v={_state['v_close']:+.2f}m/s cmd L={left_vel:+.1f} R={right_vel:+.1f} "
+              f"v={_state['v_close']:+.2f}m/s yaw={yaw_rate:+.2f}rad/s "
+              f"cmd L={left_vel:+.1f} R={right_vel:+.1f} "
               f"hdg={math.degrees(_state['heading']):+.1f}deg")
 # ===========================================================================
 
