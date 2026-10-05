@@ -55,3 +55,10 @@ c.loop_forever()
 
 mosquitto_sub -h localhost -t "\$SYS/broker/messages/stored" -C 1
 mosquitto_sub -h localhost -t "\$SYS/broker/publish/messages/dropped" -C 1
+
+sudo apt update
+sudo apt install -y libgl1-mesa-dri mesa-va-drivers mesa-vulkan-drivers intel-media-va-driver
+
+sudo apt install -y libgl1-mesa-dri mesa-vulkan-drivers
+
+glxinfo -B | grep -E "OpenGL renderer|OpenGL vendor"
