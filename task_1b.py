@@ -22,19 +22,25 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
 FOLLOW_LEFT_WALL = True    # True: track left wall, False: track right wall
-BASE_SPEED = 10.0          # rad/s, cruising wheel speed  (was 6.0)
-MAX_WHEEL = 16.0           # rad/s, saturation limit      (was 12.0)
+BASE_SPEED = 10.0          # rad/s, cruising wheel speed
+SETTLE_SPEED = 6.0         # rad/s, speed while settling onto the wall
+MAX_WHEEL = 16.0           # rad/s, saturation limit
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
 WALL_TARGET = 0.10         # m, desired distance to the tracked wall
-FRONT_STOP = 0.14          # m, front wall closer than this -> turn (a bit earlier at speed)
+FRONT_STOP = 0.14          # m, front wall closer than this -> turn
 OPEN_THRESH = 0.25         # m, side reading above this -> wall opening
 ADVANCE_T = 0.15           # s, drive straight into a junction before turning
 ENTER_T = 0.24             # s, drive straight after turning to re-find wall
+START_T = 0.5              # s, minimum straight run at start before looking for a wall
+SETTLE_TOL = 0.01          # m, |wall error| considered "on the wall"
+SETTLE_T = 0.3             # s, must stay within tolerance this long to finish settling
 
 WALL_KP, WALL_KI, WALL_KD = 50.0, 0.5, 5.0     # wall-distance PID
 TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
+HOLD_KP, HOLD_KI, HOLD_KD = 8.0, 0.0, 0.2      # heading PID (straight-line hold)
 TURN_MAX = 8.0             # rad/s, max wheel speed during in-place turns
+HOLD_MAX = 4.0             # rad/s, max correction while holding heading
 TURN_TOL = math.radians(2.5)   # rad, heading error considered "done"
 SLOW_ZONE = 0.20           # m, start easing off the throttle this far past FRONT_STOP
 
@@ -63,12 +69,16 @@ class PID:
 
 _wall_pid = PID(WALL_KP, WALL_KI, WALL_KD, out_limit=BASE_SPEED, i_limit=2.0)
 _turn_pid = PID(TURN_KP, TURN_KI, TURN_KD, out_limit=TURN_MAX, i_limit=1.0)
+_hold_pid = PID(HOLD_KP, HOLD_KI, HOLD_KD, out_limit=HOLD_MAX, i_limit=1.0)
 
 # Controller state (module-level so on_message's signature stays untouched)
 _state = {
-    "mode": "FOLLOW",   # FOLLOW | ADVANCE | TURN | ENTER
+    "mode": "STRAIGHT", # STRAIGHT -> SETTLE -> FOLLOW (ADVANCE / TURN / ENTER as needed)
     "timer": 0.0,       # s, used by ADVANCE / ENTER
+    "elapsed": 0.0,     # s, time spent in STRAIGHT
+    "ok_time": 0.0,     # s, time spent within SETTLE_TOL while settling
     "heading": 0.0,     # rad, integrated gyro yaw
+    "hold": 0.0,        # rad, heading to hold on straight runs
     "target": 0.0,      # rad, heading goal while TURN
     "next_turn": 0.0,   # rad, turn to apply after ADVANCE (+ = left)
 }
@@ -96,6 +106,13 @@ def _start_turn(angle):
     _turn_pid.reset()
 
 
+def _hold_straight(speed, dt):
+    """Drive at `speed` while holding the stored heading using the gyro."""
+    err = _state["hold"] - _state["heading"]
+    w = _hold_pid.update(err, dt)               # + = steer left
+    return _clamp(speed - w), _clamp(speed + w)
+
+
 def _controller(fl, fr, sl, sr, yaw_rate, dt):
     """Return (left_vel, right_vel) in rad/s."""
     fl, fr, sl, sr = _clean(fl), _clean(fr), _clean(sl), _clean(sr)
@@ -113,6 +130,8 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     if mode == "TURN":
         err = _state["target"] - _state["heading"]
         if abs(err) < TURN_TOL and abs(yaw_rate) < 0.3:
+            _state["hold"] = _state["target"]   # new straight-line reference
+            _hold_pid.reset()
             _state["mode"] = "ENTER"
             _state["timer"] = ENTER_T
             _wall_pid.reset()
@@ -120,13 +139,49 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
         w = _turn_pid.update(err, dt)           # + = turn left
         return _clamp(-w), _clamp(w)
 
+    # ---- STRAIGHT: first get onto a straight line, then look for a wall ----
+    if mode == "STRAIGHT":
+        _state["elapsed"] += dt
+        if front < FRONT_STOP:                  # wall ahead before finding a side wall
+            _start_turn(block_turn)
+            return 0.0, 0.0
+        if _state["elapsed"] >= START_T and side < OPEN_THRESH:
+            _state["mode"] = "SETTLE"           # wall found -> settle onto it
+            _state["ok_time"] = 0.0
+            _wall_pid.reset()
+        return _hold_straight(BASE_SPEED, dt)
+
+    # ---- SETTLE: slowly move to WALL_TARGET and stay there ----
+    if mode == "SETTLE":
+        if front < FRONT_STOP:                  # too close ahead -> turn
+            _start_turn(block_turn)
+            return 0.0, 0.0
+        if side > OPEN_THRESH:                  # lost the wall -> go straight again
+            _state["mode"] = "STRAIGHT"
+            _state["elapsed"] = START_T
+            _hold_pid.reset()
+            return _hold_straight(BASE_SPEED, dt)
+        err = side - WALL_TARGET
+        if abs(err) < SETTLE_TOL:
+            _state["ok_time"] += dt
+            if _state["ok_time"] >= SETTLE_T:
+                _state["mode"] = "FOLLOW"
+        else:
+            _state["ok_time"] = 0.0
+        u = _wall_pid.update(err, dt)
+        if FOLLOW_LEFT_WALL:
+            left, right = SETTLE_SPEED - u, SETTLE_SPEED + u
+        else:
+            left, right = SETTLE_SPEED + u, SETTLE_SPEED - u
+        return _clamp(left), _clamp(right)
+
     # ---- ADVANCE: roll forward into the junction, then turn ----
     if mode == "ADVANCE":
         _state["timer"] -= dt
         if front < FRONT_STOP or _state["timer"] <= 0.0:
             _start_turn(_state["next_turn"])
             return 0.0, 0.0
-        return BASE_SPEED, BASE_SPEED
+        return _hold_straight(BASE_SPEED, dt)
 
     # ---- ENTER: go straight after a turn so the wall is re-acquired ----
     if mode == "ENTER":
@@ -137,18 +192,20 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
         if _state["timer"] <= 0.0:
             _state["mode"] = "FOLLOW"
             _wall_pid.reset()
-        return BASE_SPEED, BASE_SPEED
+        return _hold_straight(BASE_SPEED, dt)
 
     # ---- FOLLOW: PID on distance to the tracked wall ----
-    if front < FRONT_STOP:                      # wall ahead (or dead end)
+    if front < FRONT_STOP:                      # wall too close ahead (or dead end)
         _start_turn(block_turn)
         return 0.0, 0.0
 
     if side > OPEN_THRESH:                      # opening on the tracked side
+        _state["hold"] = _state["heading"]      # keep going straight into the gap
+        _hold_pid.reset()
         _state["mode"] = "ADVANCE"
         _state["timer"] = ADVANCE_T
         _state["next_turn"] = open_turn
-        return BASE_SPEED, BASE_SPEED
+        return _hold_straight(BASE_SPEED, dt)
 
     err = side - WALL_TARGET                    # + = too far from the wall
     u = _wall_pid.update(err, dt)               # + = steer toward the wall
