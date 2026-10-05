@@ -14,24 +14,24 @@ import paho.mqtt.client as mqtt
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-TOPIC_SENSORS = "pacbot/sensors"      # simulator publishes, this file subscribes
-TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribes
+TOPIC_SENSORS = "pacbot/sensors"
+TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 
 # --- Navigation Parameters ---
-MAX_SPEED = 5.5              # Cruising speed (rad/s)
-MIN_SPEED = 1.0              # Slow approach speed (rad/s)
-TURN_SPEED = 3.0             # In-place rotation speed (rad/s)
+MAX_SPEED = 4.5              # Controlled forward cruise speed (rad/s)
+MIN_SPEED = 0.8              # Creep speed when nearing the wall (rad/s)
+TURN_SPEED = 2.5             # Safe in-place rotation speed (rad/s)
 
-# Sensor offsets: stopping around 0.055m puts the bot's rotation center
-# directly at the center of the 0.22m cell intersection.
-STOP_DIST = 0.058            # Closer distance to prevent early turns (m)
-SLOW_DIST = 0.220            # Begin smooth deceleration within 1 corridor width (m)
+# Safe stopping distance inside a 0.22m corridor
+STOP_DIST = 0.085            # Triggers brake and turn (m)
+SLOW_DIST = 0.350            # Distance where smooth braking starts (m)
 
 # --- State Machine Tracking ---
-# States: 'MOVE_FORWARD', 'TURNING'
+# States: 'MOVE_FORWARD', 'BRAKE_STOP', 'TURNING'
 state = 'MOVE_FORWARD'
 accumulated_yaw = 0.0
 target_angle = 0.0
+stop_counter = 0
 
 
 def _mqtt_client():
@@ -43,7 +43,7 @@ def _mqtt_client():
 
 
 def on_message(client, userdata, msg):
-    global state, accumulated_yaw, target_angle
+    global state, accumulated_yaw, target_angle, stop_counter
 
     data = json.loads(msg.payload.decode())
 
@@ -59,25 +59,14 @@ def on_message(client, userdata, msg):
     right_vel = 0.0
 
     if state == 'MOVE_FORWARD':
-        # Reached intersection center: initiate turn
         if front_dist <= STOP_DIST:
-            accumulated_yaw = 0.0
-
-            # Turn toward whichever side has more clearance
-            if sl > sr:
-                # Turn Left (+90 deg)
-                target_angle = math.pi / 2.0
-                left_vel = -TURN_SPEED
-                right_vel = TURN_SPEED
-            else:
-                # Turn Right (-90 deg)
-                target_angle = -math.pi / 2.0
-                left_vel = TURN_SPEED
-                right_vel = -TURN_SPEED
-
-            state = 'TURNING'
+            # Active brake to eliminate linear inertia before turning
+            state = 'BRAKE_STOP'
+            stop_counter = 0
+            left_vel = 0.0
+            right_vel = 0.0
         else:
-            # Proportional braking to reach STOP_DIST gently without ramming
+            # Linear deceleration as the wall gets closer
             if front_dist < SLOW_DIST:
                 ratio = (front_dist - STOP_DIST) / (SLOW_DIST - STOP_DIST)
                 ratio = max(0.0, min(1.0, ratio))
@@ -88,11 +77,29 @@ def on_message(client, userdata, msg):
             left_vel = speed
             right_vel = speed
 
+    elif state == 'BRAKE_STOP':
+        # Hold zero velocity for 5 simulation ticks (~10ms) to settle physics
+        left_vel = 0.0
+        right_vel = 0.0
+        stop_counter += 1
+
+        if stop_counter >= 5:
+            accumulated_yaw = 0.0
+            # Read side clearance while stationary to choose the open path
+            if sl > sr:
+                target_angle = math.pi / 2.0   # Turn Left
+                left_vel = -TURN_SPEED
+                right_vel = TURN_SPEED
+            else:
+                target_angle = -math.pi / 2.0  # Turn Right
+                left_vel = TURN_SPEED
+                right_vel = -TURN_SPEED
+
+            state = 'TURNING'
+
     elif state == 'TURNING':
-        # Integrate gyro rate
         accumulated_yaw += yaw_rate * dt
 
-        # Complete rotation
         is_turn_done = False
         if target_angle > 0:  # Turning Left
             if accumulated_yaw >= target_angle:
