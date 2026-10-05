@@ -30,11 +30,11 @@ BASE_SPEED = 6.0          # rad/s per wheel while cruising
 MIN_SPEED = 1.5           # rad/s, creep speed right before the stop point
 START_STRAIGHT_TIME = 1.0 # s of straight driving with front sensors ignored
 
-# Front wall detection / collision avoidance
-FRONT_ARM_DIST = 0.20     # front must read above this before trigger arms
-FRONT_STOP = 0.12         # m, stop and turn below this
-FRONT_EMERGENCY = 0.08    # m, brake immediately (no confirmation) below this
-SLOW_DIST = 0.30          # m, begin slowing below this
+# Front wall detection / collision avoidance.
+# "front" = max(fl, fr): both front sensors must see the wall.
+FRONT_STOP = 0.15         # m, stop and turn below this
+FRONT_EMERGENCY = 0.11    # m, brake immediately (no confirmation) below this
+SLOW_DIST = 0.35          # m, begin slowing below this
 FRONT_CONFIRM = 3         # consecutive samples below FRONT_STOP to trigger
 MAX_VALID = 1.0           # m, readings above this / non-finite = open space
 
@@ -66,7 +66,6 @@ state = {
     "mode": "START",      # START -> DRIVE -> BRAKE -> TURN -> SETTLE -> DRIVE
     "t": 0.0,
     "t_mode": 0.0,
-    "armed": False,
     "front_count": 0,
     "heading": 0.0,       # integrated yaw while driving (rad)
     "angle": 0.0,         # integrated yaw during a turn
@@ -102,7 +101,7 @@ def _mqtt_client():
 
 def _start_brake():
     state.update(mode="BRAKE", t_mode=0.0, angle=0.0, front_count=0,
-                 armed=False, bias_sum=0.0, sl_sum=0.0, sr_sum=0.0, n=0)
+                 bias_sum=0.0, sl_sum=0.0, sr_sum=0.0, n=0)
 
 
 def on_message(client, userdata, msg):
@@ -125,7 +124,8 @@ def on_message(client, userdata, msg):
         state["seen"][k][0] = min(state["seen"][k][0], v)
         state["seen"][k][1] = max(state["seen"][k][1], v)
 
-    front = min(_val(fl), _val(fr))
+    # Both front sensors must see a close wall for it to count.
+    front = max(_val(fl), _val(fr))
     mode = state["mode"]
     left_vel = 0.0
     right_vel = 0.0
@@ -133,24 +133,19 @@ def on_message(client, userdata, msg):
     if mode in ("START", "DRIVE"):
         state["heading"] += rate * dt
 
-        # Front-wall logic (disabled during START).
         speed = BASE_SPEED
-        if mode == "DRIVE":
-            if not state["armed"] and front > FRONT_ARM_DIST:
-                state["armed"] = True
-                state["front_count"] = 0
-            if state["armed"]:
-                state["front_count"] = state["front_count"] + 1 \
-                    if front < FRONT_STOP else 0
-                if (state["front_count"] >= FRONT_CONFIRM
-                        or front < FRONT_EMERGENCY):
-                    _start_brake()
-                else:
-                    k = _clamp((front - FRONT_STOP) / (SLOW_DIST - FRONT_STOP),
-                               0.0, 1.0)
-                    speed = MIN_SPEED + k * (BASE_SPEED - MIN_SPEED)
-        elif state["t"] >= START_STRAIGHT_TIME:
-            state["mode"] = "DRIVE"
+        if mode == "START":
+            if state["t"] >= START_STRAIGHT_TIME:
+                state["mode"] = "DRIVE"
+        else:
+            state["front_count"] = state["front_count"] + 1 \
+                if front < FRONT_STOP else 0
+            if state["front_count"] >= FRONT_CONFIRM or front < FRONT_EMERGENCY:
+                _start_brake()          # wheels stay at 0 from this step on
+            else:
+                k = _clamp((front - FRONT_STOP) / (SLOW_DIST - FRONT_STOP),
+                           0.0, 1.0)
+                speed = MIN_SPEED + k * (BASE_SPEED - MIN_SPEED)
 
         if state["mode"] in ("START", "DRIVE"):
             # Hold heading with the gyro.
@@ -208,9 +203,9 @@ def on_message(client, userdata, msg):
             if abs(state["target"] - state["angle"]) > SETTLE_TOL:
                 state["mode"] = "TURN"            # correct residual error
             else:
-                state.update(mode="DRIVE", heading=0.0)
+                state.update(mode="DRIVE", heading=0.0, front_count=0)
 
-    print(f"{state['mode']:6s} arm={int(state['armed'])} "
+    print(f"{state['mode']:6s} front={front:.3f} "
           f"fl={fl:.3f} fr={fr:.3f} sl={sl:.3f} sr={sr:.3f} "
           f"ang={math.degrees(state['angle']):+.1f} "
           f"L={left_vel:+.2f} R={right_vel:+.2f}")
