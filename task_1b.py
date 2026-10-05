@@ -1,4 +1,4 @@
-"""PB Task 1B - corridor following with PID + gyro-integrated turns.
+"""PB Task 1B - corridor following with PID + stop-and-turn at corners.
 
 Run (three terminals):
     mosquitto
@@ -53,11 +53,15 @@ D_ALPHA = 0.2             # low-pass factor for derivative term
 K_HEAD = 6.0              # rad/s of differential per rad of heading error
 K_GYRO = 1.0              # damping on yaw rate
 
-# Turns
-TURN_RATE_MAX = 2.5       # rad/s body yaw rate during turns
-TURN_RATE_MIN = 0.6
+# Stop-and-turn
+BRAKE_TIME = 0.35         # s at zero speed before measuring bias / turning
+BIAS_TIME = 0.15          # s of stationary gyro averaging (after BRAKE_TIME)
+TURN_RATE_MAX = 2.0       # rad/s body yaw rate during turns
+TURN_RATE_MIN = 0.5
 TURN_KP = 4.0
-TURN_TOL = math.radians(1.5)
+TURN_TOL = math.radians(1.0)    # stop commanding rotation inside this
+SETTLE_TIME = 0.3         # s stationary after the turn, gyro still integrating
+SETTLE_TOL = math.radians(2.0)  # re-turn if still off by more than this
 PREFER = +1               # +1 = prefer left at junctions, -1 = right
                           # (yaw about +z is counter-clockwise = left)
 
@@ -65,8 +69,9 @@ PREFER = +1               # +1 = prefer left at junctions, -1 = right
 # Controller state
 # ----------------------------------------------------------------------------
 state = {
-    "mode": "START",      # START -> FOLLOW <-> TURN
+    "mode": "START",      # START -> FOLLOW -> BRAKE -> TURN -> SETTLE -> FOLLOW
     "t": 0.0,             # time since launch (s)
+    "t_mode": 0.0,        # time spent in current BRAKE / SETTLE phase (s)
     "armed": False,       # front-wall trigger armed?
     "front_count": 0,     # consecutive samples below FRONT_STOP
     "heading": 0.0,       # integrated yaw since last reset (rad)
@@ -75,6 +80,9 @@ state = {
     "d_filt": 0.0,
     "angle": 0.0,         # integrated yaw during a turn
     "target": 0.0,        # target yaw change for the current turn
+    "bias": 0.0,          # gyro z bias measured while stopped
+    "bias_sum": 0.0,
+    "bias_n": 0,
     "seen": {k: [1e9, -1e9] for k in ("fl", "fr", "sl", "sr")},
 }
 
@@ -122,7 +130,8 @@ def _heading_hold(yaw_rate):
     return _clamp(u, -U_LIMIT, U_LIMIT)
 
 
-def _start_turn(sl, sr):
+def _start_brake(sl, sr):
+    """Pick the turn direction now, then stop before rotating."""
     l_open = (not _valid(sl)) or sl > OPEN_DIST
     r_open = (not _valid(sr)) or sr > OPEN_DIST
     if l_open and r_open:
@@ -133,8 +142,9 @@ def _start_turn(sl, sr):
         turn = -math.pi / 2
     else:
         turn = math.pi           # dead end
-    state.update(mode="TURN", angle=0.0, target=turn, front_count=0,
-                 armed=False)
+    state.update(mode="BRAKE", t_mode=0.0, target=turn, angle=0.0,
+                 front_count=0, armed=False,
+                 bias_sum=0.0, bias_n=0)
     _reset_pid()
 
 
@@ -175,19 +185,43 @@ def on_message(client, userdata, msg):
             state["heading"] = 0.0
             _reset_pid()
 
+    elif state["mode"] == "BRAKE":
+        # Wheels at zero. Wait for the robot to stop, then average the gyro
+        # while stationary to get its bias.
+        state["t_mode"] += dt
+        if state["t_mode"] >= BRAKE_TIME:
+            state["bias_sum"] += yaw_rate
+            state["bias_n"] += 1
+            if state["t_mode"] >= BRAKE_TIME + BIAS_TIME:
+                if state["bias_n"] > 0:
+                    state["bias"] = state["bias_sum"] / state["bias_n"]
+                state["angle"] = 0.0
+                state["mode"] = "TURN"
+
     elif state["mode"] == "TURN":
-        # Gyro-integrated angle tells us how far we have really rotated.
-        state["angle"] += yaw_rate * dt
+        # Gyro-integrated angle (bias removed) is the real rotation.
+        state["angle"] += (yaw_rate - state["bias"]) * dt
         err = state["target"] - state["angle"]
         if abs(err) < TURN_TOL:
-            state["mode"] = "FOLLOW"
-            state["heading"] = 0.0
-            _reset_pid()
+            state.update(mode="SETTLE", t_mode=0.0)
         else:
             w = _clamp(TURN_KP * abs(err), TURN_RATE_MIN, TURN_RATE_MAX)
             w = math.copysign(w, err)
             wheel = w * (TRACK / 2.0) / WHEEL_R   # in-place rotation
             left_vel, right_vel = -wheel, wheel
+
+    elif state["mode"] == "SETTLE":
+        # Stop again; keep integrating so any coasting is counted.
+        state["angle"] += (yaw_rate - state["bias"]) * dt
+        state["t_mode"] += dt
+        if state["t_mode"] >= SETTLE_TIME:
+            err = state["target"] - state["angle"]
+            if abs(err) > SETTLE_TOL:
+                state["mode"] = "TURN"          # correct the residual
+            else:
+                state["mode"] = "FOLLOW"
+                state["heading"] = 0.0
+                _reset_pid()
 
     else:  # FOLLOW
         # Arm the front trigger only after the sensors have shown open space.
@@ -199,9 +233,9 @@ def on_message(client, userdata, msg):
             state["front_count"] = state["front_count"] + 1 \
                 if front < FRONT_STOP else 0
             if state["front_count"] >= FRONT_CONFIRM:
-                _start_turn(sl, sr)
+                _start_brake(sl, sr)
 
-        if state["mode"] == "FOLLOW":      # no turn was just started
+        if state["mode"] == "FOLLOW":      # no stop was just started
             if state["armed"]:
                 k = _clamp((front - FRONT_STOP) / (SLOW_DIST - FRONT_STOP),
                            0.0, 1.0)
