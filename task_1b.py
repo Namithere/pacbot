@@ -21,15 +21,17 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
-SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = original speed)
-BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, cruising wheel speed
+SPEED_SCALE = 5.0          # overall speed multiplier (1.0 = original speed)
+BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, top cruising wheel speed
 MAX_WHEEL = 16.0 * SPEED_SCALE     # rad/s, saturation limit
-MIN_SPEED = 8.0            # rad/s, creep speed when right at a wall
+MIN_SPEED = 4.0            # rad/s, creep speed right at the stop distance
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
 WALL_TARGET = 0.05         # m, desired distance to a side wall while driving
-FRONT_STOP = 0.09          # m, front wall closer than this -> stop and turn
-BRAKE_ZONE = 0.60          # m, start slowing this far before FRONT_STOP
+FRONT_STOP = 0.14          # m, front wall closer than this -> brake and turn
+BRAKE_GAIN = 70.0          # rad/s per sqrt(m): bigger = brakes later / harder
+BRAKE_T = 0.06             # s, short reverse pulse to kill momentum before turning
+BRAKE_REV = 0.5            # fraction of the current speed applied in reverse
 OPEN_THRESH = 0.15         # m, a side wall farther than this is ignored (gap)
 
 WALL_KP, WALL_KI, WALL_KD = 80.0, 0.5, 6.0     # wall-distance PID
@@ -68,11 +70,13 @@ _hold_pid = PID(HOLD_KP, HOLD_KI, HOLD_KD, out_limit=HOLD_MAX, i_limit=1.0)
 
 # Controller state (module-level so on_message's signature stays untouched)
 _state = {
-    "mode": "STRAIGHT", # STRAIGHT <-> TURN
+    "mode": "STRAIGHT", # STRAIGHT -> BRAKE -> TURN -> STRAIGHT ...
     "heading": 0.0,     # rad, integrated gyro yaw
     "hold": 0.0,        # rad, heading to hold on straight runs
     "target": 0.0,      # rad, heading goal while TURN
-    "wall": False,      # True while a side wall is being tracked
+    "timer": 0.0,       # s, BRAKE countdown
+    "pending": 0.0,     # rad, turn to make once braking is done
+    "last_speed": 0.0,  # rad/s, last forward speed (for the reverse pulse)
 }
 
 
@@ -92,13 +96,13 @@ def _clamp(v):
 
 
 def _approach_speed(front):
-    """Cruise speed scaled down linearly as a front wall gets closer.
+    """Speed limit that guarantees we can stop: v = MIN + K * sqrt(distance left).
 
-    Full speed at FRONT_STOP + BRAKE_ZONE or farther, MIN_SPEED at FRONT_STOP.
+    This is the shape of a constant-deceleration stop, so the bot stays fast in
+    long corridors but is already crawling by the time it reaches FRONT_STOP.
     """
-    frac = (front - FRONT_STOP) / BRAKE_ZONE
-    frac = max(0.0, min(1.0, frac))
-    return MIN_SPEED + (BASE_SPEED - MIN_SPEED) * frac
+    room = max(0.0, front - FRONT_STOP)
+    return min(BASE_SPEED, MIN_SPEED + BRAKE_GAIN * math.sqrt(room))
 
 
 def _start_turn(angle):
@@ -121,7 +125,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     _state["heading"] += yaw_rate * dt          # gyro-integrated heading
 
     front = min(fl, fr)
-    speed = _approach_speed(front)              # brakes automatically near walls
+    speed = _approach_speed(front)              # slows early enough to stop in time
 
     # ---- TURN: rotate in place using gyro heading ----
     if _state["mode"] == "TURN":
@@ -130,25 +134,34 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             _state["hold"] = _state["target"]   # new straight-line reference
             _hold_pid.reset()
             _wall_pid.reset()
-            _state["wall"] = False
             _state["mode"] = "STRAIGHT"         # resume driving forward
             return 0.0, 0.0
         w = _turn_pid.update(err, dt)           # + = turn left
         return _clamp(-w), _clamp(w)
 
-    # ---- STRAIGHT: drive until a wall is detected in front, then turn to the open side ----
+    # ---- BRAKE: short reverse pulse to kill momentum, then turn ----
+    if _state["mode"] == "BRAKE":
+        _state["timer"] -= dt
+        if _state["timer"] <= 0.0:
+            _start_turn(_state["pending"])
+            return 0.0, 0.0
+        rev = -BRAKE_REV * _state["last_speed"]
+        return _clamp(rev), _clamp(rev)
+
+    # ---- STRAIGHT: drive until a wall is detected in front, then brake and turn ----
     if front < FRONT_STOP:
-        _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
+        _state["pending"] = math.pi / 2 if sl >= sr else -math.pi / 2
+        _state["mode"] = "BRAKE"
+        _state["timer"] = BRAKE_T
         return 0.0, 0.0
+
+    _state["last_speed"] = speed
 
     # Keep a steady distance from a side wall while one is present.
     # A side opening (gap) is ignored: the bot just holds its heading past it.
     side = min(sl, sr)
     if side < OPEN_THRESH:
         wall_left = sl <= sr
-        if not _state["wall"]:
-            _wall_pid.reset()
-            _state["wall"] = True
         _state["hold"] = _state["heading"]      # keep hold-heading current for smooth hand-over
         err = side - WALL_TARGET                # + = too far from the wall
         u = _wall_pid.update(err, dt)           # + = steer toward the wall
@@ -158,7 +171,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             left, right = speed + u, speed - u  # steer right toward the wall
         return _clamp(left), _clamp(right)
 
-    _state["wall"] = False
+    _wall_pid.reset()
     return _hold_straight(speed, dt)            # no side wall: go straight on gyro heading
 # ===========================================================================
 
