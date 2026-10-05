@@ -21,18 +21,16 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
-SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = previous version)
+SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = original speed)
 BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, cruising wheel speed
 MAX_WHEEL = 16.0 * SPEED_SCALE     # rad/s, saturation limit
 MIN_SPEED = 8.0            # rad/s, creep speed when right at a wall
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
-WALL_TARGET = 0.05         # m, desired distance to the tracked wall (close walls)
+WALL_TARGET = 0.05         # m, desired distance to a side wall while driving
 FRONT_STOP = 0.09          # m, front wall closer than this -> stop and turn
 BRAKE_ZONE = 0.60          # m, start slowing this far before FRONT_STOP
-OPEN_THRESH = 0.15         # m, side reading above this -> wall has disappeared
-ADVANCE_T = 0.15 / SPEED_SCALE     # s, drive straight into a gap before turning into it
-ENTER_T = 0.24 / SPEED_SCALE       # s, drive straight after a turn before following a wall
+OPEN_THRESH = 0.15         # m, a side wall farther than this is ignored (gap)
 
 WALL_KP, WALL_KI, WALL_KD = 80.0, 0.5, 6.0     # wall-distance PID
 TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
@@ -70,13 +68,11 @@ _hold_pid = PID(HOLD_KP, HOLD_KI, HOLD_KD, out_limit=HOLD_MAX, i_limit=1.0)
 
 # Controller state (module-level so on_message's signature stays untouched)
 _state = {
-    "mode": "STRAIGHT", # STRAIGHT -> TURN -> ENTER -> FOLLOW (-> ADVANCE -> TURN ...)
-    "side": None,       # 'L' or 'R': which wall is being followed
-    "timer": 0.0,       # s, used by ADVANCE / ENTER
+    "mode": "STRAIGHT", # STRAIGHT <-> TURN
     "heading": 0.0,     # rad, integrated gyro yaw
     "hold": 0.0,        # rad, heading to hold on straight runs
     "target": 0.0,      # rad, heading goal while TURN
-    "next_turn": 0.0,   # rad, turn to apply after ADVANCE (+ = left)
+    "wall": False,      # True while a side wall is being tracked
 }
 
 
@@ -126,70 +122,44 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
 
     front = min(fl, fr)
     speed = _approach_speed(front)              # brakes automatically near walls
-    mode = _state["mode"]
 
     # ---- TURN: rotate in place using gyro heading ----
-    if mode == "TURN":
+    if _state["mode"] == "TURN":
         err = _state["target"] - _state["heading"]
         if abs(err) < TURN_TOL and abs(yaw_rate) < 0.3:
             _state["hold"] = _state["target"]   # new straight-line reference
             _hold_pid.reset()
-            _state["mode"] = "ENTER"
-            _state["timer"] = ENTER_T
+            _wall_pid.reset()
+            _state["wall"] = False
+            _state["mode"] = "STRAIGHT"         # resume driving forward
             return 0.0, 0.0
         w = _turn_pid.update(err, dt)           # + = turn left
         return _clamp(-w), _clamp(w)
 
-    # ---- STRAIGHT: drive on a straight line; stop at the first wall, turn to the open side ----
-    if mode == "STRAIGHT":
-        if front < FRONT_STOP:
-            _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
-            return 0.0, 0.0
-        return _hold_straight(speed, dt)
-
-    # ---- ENTER: go straight after a turn, then start following the nearer wall ----
-    if mode == "ENTER":
-        _state["timer"] -= dt
-        if front < FRONT_STOP:                  # another wall right away -> turn again
-            _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
-            return 0.0, 0.0
-        if _state["timer"] <= 0.0:
-            _state["side"] = "L" if sl <= sr else "R"
-            _state["mode"] = "FOLLOW"
-            _wall_pid.reset()
-        return _hold_straight(speed, dt)
-
-    # ---- ADVANCE: wall disappeared -> roll forward into the gap, then turn that way ----
-    if mode == "ADVANCE":
-        _state["timer"] -= dt
-        if front < FRONT_STOP or _state["timer"] <= 0.0:
-            _start_turn(_state["next_turn"])
-            return 0.0, 0.0
-        return _hold_straight(speed, dt)
-
-    # ---- FOLLOW: PID on distance to the tracked wall ----
-    follow_left = _state["side"] == "L"
-    side = sl if follow_left else sr            # tracked wall distance
-
-    if front < FRONT_STOP:                      # wall ahead: stop, turn away from tracked wall
-        _start_turn(-math.pi / 2 if follow_left else math.pi / 2)
+    # ---- STRAIGHT: drive until a wall is detected in front, then turn to the open side ----
+    if front < FRONT_STOP:
+        _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
         return 0.0, 0.0
 
-    if side > OPEN_THRESH:                      # tracked wall gone -> go that direction next
-        _state["hold"] = _state["heading"]      # keep straight until the gap is reached
-        _hold_pid.reset()
-        _state["mode"] = "ADVANCE"
-        _state["timer"] = ADVANCE_T
-        _state["next_turn"] = math.pi / 2 if follow_left else -math.pi / 2
-        return _hold_straight(speed, dt)
+    # Keep a steady distance from a side wall while one is present.
+    # A side opening (gap) is ignored: the bot just holds its heading past it.
+    side = min(sl, sr)
+    if side < OPEN_THRESH:
+        wall_left = sl <= sr
+        if not _state["wall"]:
+            _wall_pid.reset()
+            _state["wall"] = True
+        _state["hold"] = _state["heading"]      # keep hold-heading current for smooth hand-over
+        err = side - WALL_TARGET                # + = too far from the wall
+        u = _wall_pid.update(err, dt)           # + = steer toward the wall
+        if wall_left:
+            left, right = speed - u, speed + u  # steer left toward the wall
+        else:
+            left, right = speed + u, speed - u  # steer right toward the wall
+        return _clamp(left), _clamp(right)
 
-    err = side - WALL_TARGET                    # + = too far from the wall
-    u = _wall_pid.update(err, dt)               # + = steer toward the wall
-    if follow_left:
-        left, right = speed - u, speed + u      # steer left toward the wall
-    else:
-        left, right = speed + u, speed - u      # steer right toward the wall
-    return _clamp(left), _clamp(right)
+    _state["wall"] = False
+    return _hold_straight(speed, dt)            # no side wall: go straight on gyro heading
 # ===========================================================================
 
 
