@@ -1,7 +1,12 @@
 """Boilerplate for PB Task 1B.
 
 Subscribes to the simulator's sensor topic, logs each reading, and publishes
-a wheel velocity command back.
+a wheel velocity command back. Fill in your control logic where marked.
+
+Run (three terminals):
+    mosquitto
+    ./task_1b_launch
+    python3 task_1b_boilerplate.py
 """
 import json
 import math
@@ -9,128 +14,42 @@ import paho.mqtt.client as mqtt
 
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-TOPIC_SENSORS = "pacbot/sensors"
-TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
+TOPIC_SENSORS = "pacbot/sensors"      # simulator publishes, this file subscribes
+TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribes
 
-# ======================= CONTROLLER CONFIG =======================
-SWAP_SIDES = True          # Simulator left/right sensor reversal
+# --- PID & Navigation State ---
+TARGET_WALL_DIST = 0.22      # Desired distance to the wall (m)
+FRONT_THRESHOLD = 0.25       # Distance to detect obstacle in front (m)
+OPENING_THRESHOLD = 0.45     # Side sensor threshold indicating wall has ended (m)
 
-BASE_SPEED = 5.0           # rad/s constant forward cruise
-MAX_WHEEL = 8.0            # rad/s wheel saturation
-TURN_SPEED = 3.5           # rad/s constant spin speed during 90-deg turn
+BASE_SPEED = 7.0             # Base forward speed (rad/s)
+TURN_SPEED = 4.0             # In-place turn speed (rad/s)
 
-CORRIDOR_W = 0.22          # m
-FRONT_STOP = 0.075         # m, stop distance from front wall
-SIDE_WALL_THRESH = 0.16    # m, values larger than this mean an opening
+KP = 22.0
+KI = 0.2
+KD = 1.2
 
-TURN_ANGLE = math.radians(90.0)
-TURN_TOL = math.radians(4.0)  # 4 degrees tolerance to exit turn cleanly
+integral_error = 0.0
+prev_error = 0.0
+current_yaw = 0.0
+target_turn_angle = 0.0
 
-# Simple state tracking
-_state = {
-    "mode": "STRAIGHT",     # "STRAIGHT", "STOP", "TURN"
-    "heading": 0.0,
-    "target_heading": 0.0,
-    "stop_timer": 0.0,
-    "front_confirm": 0,
-    "count": 0,
-}
+# States: 'FORWARD', 'FOLLOW_WALL', 'TURN_CORNER', 'TURN_OPENING'
+state = 'FORWARD'
 
 
-def _clean(x):
-    """Filter invalid readings."""
-    try:
-        val = float(x)
-        if math.isnan(val) or math.isinf(val) or val <= 0.005:
-            return 2.0
-        return min(val, 2.0)
-    except (TypeError, ValueError):
-        return 2.0
-
-
-def _clamp(v):
-    return max(-MAX_WHEEL, min(MAX_WHEEL, v))
-
-
-def _set_mode(new_mode):
-    if new_mode != _state["mode"]:
-        print(f"[mode] {_state['mode']} -> {new_mode} | Hdg: {math.degrees(_state['heading']):.1f}°")
-        _state["mode"] = new_mode
-
-
-def _controller(fl, fr, sl, sr, yaw_rate, dt):
-    fl, fr = _clean(fl), _clean(fr)
-    sl, sr = _clean(sl), _clean(sr)
-    if SWAP_SIDES:
-        sl, sr = sr, sl
-
-    _state["heading"] += yaw_rate * dt
-    front = min(fl, fr)
-    mode = _state["mode"]
-
-    # ---------------- 1. STOP MODE (Pause briefly before turning) ----------------
-    if mode == "STOP":
-        _state["stop_timer"] += dt
-        if _state["stop_timer"] >= 0.15:  # Pause for 150 ms to kill linear momentum
-            _set_mode("TURN")
-        return 0.0, 0.0
-
-    # ---------------- 2. TURN MODE (Rotate precisely by 90 deg) ----------------
-    if mode == "TURN":
-        err = _state["target_heading"] - _state["heading"]
-
-        # Turn finished when target angle is reached within tolerance
-        if abs(err) <= TURN_TOL:
-            _set_mode("STRAIGHT")
-            return 0.0, 0.0
-
-        # Rotate left (+err) or right (-err)
-        direction = 1.0 if err > 0 else -1.0
-        left_cmd = -direction * TURN_SPEED
-        right_cmd = direction * TURN_SPEED
-        return _clamp(left_cmd), _clamp(right_cmd)
-
-    # ---------------- 3. STRAIGHT MODE (Drive & Center) ----------------
-    # Check if wall is reached
-    if front <= FRONT_STOP:
-        _state["front_confirm"] += 1
-        if _state["front_confirm"] >= 2:
-            # Wall detected: choose turn direction towards the opening
-            # sl > sr means the left has more free space -> turn left (+90 deg)
-            if sl > sr:
-                chosen_turn = TURN_ANGLE
-            else:
-                chosen_turn = -TURN_ANGLE
-
-            _state["target_heading"] = _state["heading"] + chosen_turn
-            _state["stop_timer"] = 0.0
-            _state["front_confirm"] = 0
-            _set_mode("STOP")
-            return 0.0, 0.0
-    else:
-        _state["front_confirm"] = 0
-
-    # Straight line steering: center between walls if both present
-    steer = 0.0
-    if sl < SIDE_WALL_THRESH and sr < SIDE_WALL_THRESH:
-        # P-controller on distance difference to stay centered
-        err_center = sl - sr  # positive if closer to right wall
-        steer = 15.0 * err_center
-
-    left_cmd = BASE_SPEED - steer
-    right_cmd = BASE_SPEED + steer
-    return _clamp(left_cmd), _clamp(right_cmd)
-
-
-def _log(fl, fr, sl, sr, yaw_rate, left_vel, right_vel):
-    _state["count"] += 1
-    if _state["count"] % 40 == 0:
-        front = min(_clean(fl), _clean(fr))
-        print(f"[{_state['mode']}] Front: {front:.3f}m | Left: {_clean(sl):.3f}m | Right: {_clean(sr):.3f}m | "
-              f"L_cmd: {left_vel:+.1f} R_cmd: {right_vel:+.1f} | Hdg: {math.degrees(_state['heading']):.1f}°")
+def pid_controller(error, dt):
+    global integral_error, prev_error
+    integral_error += error * dt
+    # Clamp integral to prevent windup
+    integral_error = max(min(integral_error, 1.0), -1.0)
+    derivative = (error - prev_error) / dt if dt > 0 else 0.0
+    prev_error = error
+    return (KP * error) + (KI * integral_error) + (KD * derivative)
 
 
 def _mqtt_client():
+    # paho-mqtt >= 2.0 requires picking a callback API version explicitly.
     try:
         return mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     except AttributeError:
@@ -138,21 +57,91 @@ def _mqtt_client():
 
 
 def on_message(client, userdata, msg):
+    global state, current_yaw, target_turn_angle, integral_error, prev_error
+
     data = json.loads(msg.payload.decode())
 
-    fl = data["fl"]
-    fr = data["fr"]
-    sl = data["sl"]
-    sr = data["sr"]
-    yaw_rate = data["gyro"][2]
-    dt = data["dt"]
+    fl = data["fl"]            # Front-left ToF distance readings
+    fr = data["fr"]            # Front-right ToF distance readings
+    sl = data["sl"]            # Side-left ToF distance readings
+    sr = data["sr"]            # Side-right ToF distance readings
+    yaw_rate = data["gyro"][2]  # rad/s about z
+    dt = data["dt"]            # s, simulator timestep
 
-    left_vel, right_vel = _controller(fl, fr, sl, sr, yaw_rate, dt)
-    _log(fl, fr, sl, sr, yaw_rate, left_vel, right_vel)
+    # Integrate gyro rate to track heading relative to turn start
+    current_yaw += yaw_rate * dt
+
+    front_dist = min(fl, fr)
+    left_vel = 0.0
+    right_vel = 0.0
+
+    if state == 'FORWARD':
+        if front_dist <= FRONT_THRESHOLD:
+            # Wall detected directly ahead: prepare in-place turn (default left: +pi/2)
+            current_yaw = 0.0
+            target_turn_angle = math.pi / 2.0
+            integral_error = 0.0
+            prev_error = 0.0
+            state = 'TURN_CORNER'
+            left_vel = -TURN_SPEED
+            right_vel = TURN_SPEED
+        else:
+            left_vel = BASE_SPEED
+            right_vel = BASE_SPEED
+
+    elif state == 'TURN_CORNER':
+        # Turn until gyro registers ~90 degree rotation
+        if current_yaw >= target_turn_angle:
+            current_yaw = 0.0
+            state = 'FOLLOW_WALL'
+            left_vel = BASE_SPEED
+            right_vel = BASE_SPEED
+        else:
+            left_vel = -TURN_SPEED
+            right_vel = TURN_SPEED
+
+    elif state == 'FOLLOW_WALL':
+        # Wall ends on the right: turn right into open corridor
+        if sr > OPENING_THRESHOLD:
+            current_yaw = 0.0
+            target_turn_angle = -math.pi / 2.0
+            state = 'TURN_OPENING'
+            left_vel = TURN_SPEED
+            right_vel = -TURN_SPEED
+
+        # Wall detected ahead: turn left to avoid collision
+        elif front_dist <= FRONT_THRESHOLD:
+            current_yaw = 0.0
+            target_turn_angle = math.pi / 2.0
+            integral_error = 0.0
+            prev_error = 0.0
+            state = 'TURN_CORNER'
+            left_vel = -TURN_SPEED
+            right_vel = TURN_SPEED
+
+        else:
+            # PID tracking using right side distance
+            err = sr - TARGET_WALL_DIST
+            steering_adj = pid_controller(err, dt)
+
+            left_vel = BASE_SPEED + steering_adj
+            right_vel = BASE_SPEED - steering_adj
+
+    elif state == 'TURN_OPENING':
+        # Turning into the open branch (right turn)
+        if current_yaw <= target_turn_angle:
+            current_yaw = 0.0
+            integral_error = 0.0
+            prev_error = 0.0
+            state = 'FORWARD'
+            left_vel = BASE_SPEED
+            right_vel = BASE_SPEED
+        else:
+            left_vel = TURN_SPEED
+            right_vel = -TURN_SPEED
 
     client.publish(TOPIC_WHEEL_VEL, json.dumps({
-        "left": float(left_vel),
-        "right": float(right_cmd if 'right_cmd' in locals() else right_vel)
+        "left": float(left_vel), "right": float(right_vel),
     }))
 
 
