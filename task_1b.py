@@ -21,24 +21,20 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
-SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = original speed)
+SPEED_SCALE = 10.0         # overall speed multiplier (1.0 = previous version)
 BASE_SPEED = 10.0 * SPEED_SCALE    # rad/s, cruising wheel speed
 MAX_WHEEL = 16.0 * SPEED_SCALE     # rad/s, saturation limit
 MIN_SPEED = 8.0            # rad/s, creep speed when right at a wall
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
-MIN_VALID = 0.005          # m, readings at or below this are treated as invalid
 
 WALL_TARGET = 0.05         # m, desired distance to the tracked wall (close walls)
-FRONT_STOP = 0.12          # m, front wall closer than this -> stop and turn
+FRONT_STOP = 0.09          # m, front wall closer than this -> stop and turn
 BRAKE_ZONE = 0.60          # m, start slowing this far before FRONT_STOP
 OPEN_THRESH = 0.15         # m, side reading above this -> wall has disappeared
 ADVANCE_T = 0.15 / SPEED_SCALE     # s, drive straight into a gap before turning into it
 ENTER_T = 0.24 / SPEED_SCALE       # s, drive straight after a turn before following a wall
 
-STARTUP_T = 0.30           # s, at the start only react to a very close front wall
-FRONT_CONFIRM = 3          # consecutive steps front must read "blocked" before acting
-
-WALL_KP, WALL_KI, WALL_KD = 40.0, 0.5, 8.0     # wall-distance PID
+WALL_KP, WALL_KI, WALL_KD = 80.0, 0.5, 6.0     # wall-distance PID
 TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
 HOLD_KP, HOLD_KI, HOLD_KD = 8.0, 0.0, 0.2      # heading PID (straight-line hold)
 TURN_MAX = 8.0             # rad/s, max wheel speed during in-place turns
@@ -76,8 +72,6 @@ _hold_pid = PID(HOLD_KP, HOLD_KI, HOLD_KD, out_limit=HOLD_MAX, i_limit=1.0)
 _state = {
     "mode": "STRAIGHT", # STRAIGHT -> TURN -> ENTER -> FOLLOW (-> ADVANCE -> TURN ...)
     "side": None,       # 'L' or 'R': which wall is being followed
-    "t": 0.0,           # s, time since the program started receiving data
-    "front_cnt": 0,     # consecutive steps the front has read "blocked"
     "timer": 0.0,       # s, used by ADVANCE / ENTER
     "heading": 0.0,     # rad, integrated gyro yaw
     "hold": 0.0,        # rad, heading to hold on straight runs
@@ -87,12 +81,12 @@ _state = {
 
 
 def _clean(x):
-    """Replace NaN / inf / zero / negative ToF values with MAX_RANGE."""
+    """Replace NaN / inf / negative ToF values with MAX_RANGE."""
     try:
         x = float(x)
     except (TypeError, ValueError):
         return MAX_RANGE
-    if math.isnan(x) or math.isinf(x) or x <= MIN_VALID:
+    if math.isnan(x) or math.isinf(x) or x < 0.0:
         return MAX_RANGE
     return min(x, MAX_RANGE)
 
@@ -115,7 +109,6 @@ def _start_turn(angle):
     """Begin an in-place turn of `angle` rad (+ = left/CCW, - = right/CW)."""
     _state["target"] = _state["heading"] + angle
     _state["mode"] = "TURN"
-    _state["front_cnt"] = 0
     _turn_pid.reset()
 
 
@@ -128,25 +121,12 @@ def _hold_straight(speed, dt):
 
 def _controller(fl, fr, sl, sr, yaw_rate, dt):
     """Return (left_vel, right_vel) in rad/s."""
-    if not (0.0 < dt <= 0.05):                  # guard against a zero / huge first dt
-        dt = 0.002
     fl, fr, sl, sr = _clean(fl), _clean(fr), _clean(sl), _clean(sr)
-    _state["t"] += dt
     _state["heading"] += yaw_rate * dt          # gyro-integrated heading
 
     front = min(fl, fr)
     speed = _approach_speed(front)              # brakes automatically near walls
     mode = _state["mode"]
-
-    # Debounced "wall ahead": must persist for FRONT_CONFIRM steps. During the
-    # first STARTUP_T seconds only a very close wall counts, so start-up
-    # glitches can't trigger a turn before the bot has moved.
-    stop_dist = FRONT_STOP if _state["t"] > STARTUP_T else FRONT_STOP * 0.5
-    if front < stop_dist:
-        _state["front_cnt"] += 1
-    else:
-        _state["front_cnt"] = 0
-    blocked = _state["front_cnt"] >= FRONT_CONFIRM
 
     # ---- TURN: rotate in place using gyro heading ----
     if mode == "TURN":
@@ -162,7 +142,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
 
     # ---- STRAIGHT: drive on a straight line; stop at the first wall, turn to the open side ----
     if mode == "STRAIGHT":
-        if blocked:
+        if front < FRONT_STOP:
             _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
             return 0.0, 0.0
         return _hold_straight(speed, dt)
@@ -170,7 +150,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     # ---- ENTER: go straight after a turn, then start following the nearer wall ----
     if mode == "ENTER":
         _state["timer"] -= dt
-        if blocked:                             # another wall right away -> turn again
+        if front < FRONT_STOP:                  # another wall right away -> turn again
             _start_turn(math.pi / 2 if sl >= sr else -math.pi / 2)
             return 0.0, 0.0
         if _state["timer"] <= 0.0:
@@ -182,7 +162,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     # ---- ADVANCE: wall disappeared -> roll forward into the gap, then turn that way ----
     if mode == "ADVANCE":
         _state["timer"] -= dt
-        if blocked or _state["timer"] <= 0.0:
+        if front < FRONT_STOP or _state["timer"] <= 0.0:
             _start_turn(_state["next_turn"])
             return 0.0, 0.0
         return _hold_straight(speed, dt)
@@ -191,7 +171,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     follow_left = _state["side"] == "L"
     side = sl if follow_left else sr            # tracked wall distance
 
-    if blocked:                                 # wall ahead: stop, turn away from tracked wall
+    if front < FRONT_STOP:                      # wall ahead: stop, turn away from tracked wall
         _start_turn(-math.pi / 2 if follow_left else math.pi / 2)
         return 0.0, 0.0
 
