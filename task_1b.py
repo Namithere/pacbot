@@ -22,20 +22,21 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # this file publishes, simulator subscribe
 # ======================= YOUR CODE: CONTROLLER SETUP =======================
 # --- Tunables (adjust after watching a few runs) ---
 FOLLOW_LEFT_WALL = True    # True: track left wall, False: track right wall
-BASE_SPEED = 6.0           # rad/s, cruising wheel speed
-MAX_WHEEL = 12.0           # rad/s, saturation limit
+BASE_SPEED = 10.0          # rad/s, cruising wheel speed  (was 6.0)
+MAX_WHEEL = 16.0           # rad/s, saturation limit      (was 12.0)
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
 WALL_TARGET = 0.10         # m, desired distance to the tracked wall
-FRONT_STOP = 0.12          # m, front wall closer than this -> turn
+FRONT_STOP = 0.14          # m, front wall closer than this -> turn (a bit earlier at speed)
 OPEN_THRESH = 0.25         # m, side reading above this -> wall opening
-ADVANCE_T = 0.25           # s, drive straight into a junction before turning
-ENTER_T = 0.40             # s, drive straight after turning to re-find wall
+ADVANCE_T = 0.15           # s, drive straight into a junction before turning
+ENTER_T = 0.24             # s, drive straight after turning to re-find wall
 
-WALL_KP, WALL_KI, WALL_KD = 40.0, 0.5, 4.0     # wall-distance PID
-TURN_KP, TURN_KI, TURN_KD = 6.0, 0.0, 0.3      # heading PID (turns)
-TURN_MAX = 5.0             # rad/s, max wheel speed during in-place turns
-TURN_TOL = math.radians(2.0)   # rad, heading error considered "done"
+WALL_KP, WALL_KI, WALL_KD = 50.0, 0.5, 5.0     # wall-distance PID
+TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4      # heading PID (turns)
+TURN_MAX = 8.0             # rad/s, max wheel speed during in-place turns
+TURN_TOL = math.radians(2.5)   # rad, heading error considered "done"
+SLOW_ZONE = 0.20           # m, start easing off the throttle this far past FRONT_STOP
 
 
 class PID:
@@ -111,7 +112,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
     # ---- TURN: rotate in place using gyro heading ----
     if mode == "TURN":
         err = _state["target"] - _state["heading"]
-        if abs(err) < TURN_TOL and abs(yaw_rate) < 0.2:
+        if abs(err) < TURN_TOL and abs(yaw_rate) < 0.3:
             _state["mode"] = "ENTER"
             _state["timer"] = ENTER_T
             _wall_pid.reset()
@@ -151,8 +152,8 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
 
     err = side - WALL_TARGET                    # + = too far from the wall
     u = _wall_pid.update(err, dt)               # + = steer toward the wall
-    # Slow down a bit as a front wall approaches
-    speed = BASE_SPEED * min(1.0, max(0.4, (front - FRONT_STOP) / 0.15))
+    # Ease off the throttle only when a front wall is close
+    speed = BASE_SPEED * min(1.0, max(0.5, (front - FRONT_STOP) / SLOW_ZONE))
     if FOLLOW_LEFT_WALL:
         # steer left (toward wall): right wheel faster
         left, right = speed - u, speed + u
@@ -180,8 +181,7 @@ def on_message(client, userdata, msg):
     yaw_rate = data["gyro"][2]  # rad/s about z
     dt = data["dt"]            # s, simulator timestep
 
-    print(f"fl={fl:.3f} fr={fr:.3f} sl={sl:.3f} sr={sr:.3f} "
-          f"yaw_rate={yaw_rate:+.3f} dt={dt:.4f}")
+    # (per-step print removed: printing at ~500 Hz stalls the control loop)
 
     # Compute wheel velocities (rad/s) from the readings above.
     left_vel, right_vel = _controller(fl, fr, sl, sr, yaw_rate, dt)
