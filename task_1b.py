@@ -43,11 +43,17 @@ STILL_DIST = 0.003         # m, front moved less than this in a window -> counts
 STILL_YAW = 0.05           # rad/s, gyro rate below this -> not rotating
 
 CENTER_KP, CENTER_KI, CENTER_KD = 120.0, 0.5, 8.0   # centring PID (error in m)
-TURN_KP, TURN_KI, TURN_KD = 8.0, 0.0, 0.4           # heading PID (turns)
 HOLD_KP, HOLD_KI, HOLD_KD = 8.0, 0.0, 0.2           # heading PID (straight-line hold)
 STEER_MAX = 20.0           # rad/s, max differential from centring / heading hold
-TURN_MAX = 8.0             # rad/s, max wheel speed during in-place turns
-TURN_TOL = math.radians(2.5)   # rad, heading error considered "done"
+
+# --- Turning (tuned to stop overshoot) ---
+TURN_ANGLE_DEG = 90.0      # deg, size of each turn. If it still ends up past 90, try 85.
+TURN_KP, TURN_KI, TURN_KD = 6.0, 0.0, 0.8   # heading PID (turns): more damping than before
+TURN_MAX = 6.0             # rad/s, top wheel speed during in-place turns (was 8)
+TURN_MIN = 0.8             # rad/s, floor so the final degrees still finish
+TURN_SLOW_K = 6.0          # rad/s per sqrt(rad): turn speed falls off near the target
+TURN_LEAD_T = 0.06         # s, look-ahead: brake for where the bot WILL be in this long
+TURN_TOL = math.radians(2.0)   # rad, heading error considered "done"
 
 PRINT_EVERY = 50           # print one line every N sensor messages (~10 Hz at 500 Hz)
 
@@ -167,7 +173,7 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             _set_mode("TURN")
         return 0.0, 0.0
 
-    # ---- TURN: rotate in place using gyro heading ----
+    # ---- TURN: rotate in place using gyro heading, slowing down as the target nears ----
     if mode == "TURN":
         err = _state["target"] - _state["heading"]
         if abs(err) < TURN_TOL and abs(yaw_rate) < 0.3:
@@ -176,12 +182,16 @@ def _controller(fl, fr, sl, sr, yaw_rate, dt):
             _center_pid.reset()
             _set_mode("STRAIGHT")               # resume driving forward
             return 0.0, 0.0
-        w = _turn_pid.update(err, dt)           # + = turn left
+        pred_err = err - yaw_rate * TURN_LEAD_T         # where the error will be shortly
+        w = _turn_pid.update(pred_err, dt)              # + = turn left
+        w_max = min(TURN_MAX, TURN_MIN + TURN_SLOW_K * math.sqrt(abs(err)))
+        w = max(-w_max, min(w_max, w))                  # slow near the target
         return _clamp(-w), _clamp(w)
 
     # ---- STRAIGHT: drive until the wall is FRONT_STOP away, then stop (and turn) ----
     if front < FRONT_STOP:
-        _state["turn"] = math.pi / 2 if sl >= sr else -math.pi / 2   # toward the open side
+        angle = math.radians(TURN_ANGLE_DEG)
+        _state["turn"] = angle if sl >= sr else -angle               # toward the open side
         _state.update(stop_t=0.0, win_t=0.0, win_front=front, still_n=0)
         _set_mode("STOP")
         return 0.0, 0.0
