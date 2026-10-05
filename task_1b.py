@@ -36,7 +36,7 @@ MAX_WHEEL = 16.0 * SPEED_SCALE     # [scaled] rad/s, saturation limit
 MIN_SPEED = 4.0            # rad/s, creep speed at the end of the braking ramp (kept low on purpose)
 MAX_RANGE = 2.0            # m, value used for invalid / infinite ToF readings
 
-CORRIDOR_W = 0.22          # m, distance between the two walls
+CORRIDOR_W = 0.42          # m, distance between the two walls
 OPEN_THRESH = 0.20         # m, a side reading above this means no wall on that side
 FRONT_STOP = 0.06          # m, front wall closer than this -> stop, then turn
 BRAKE_MARGIN = 0.04 * _G   # [scaled] m, braking ramp reaches MIN_SPEED this far before FRONT_STOP
