@@ -24,61 +24,35 @@ WHEEL_R = 0.017
 TRACK = 0.092
 
 # ----------------------------------------------------------------------------
-# Tunables (High-Speed & Active Counter-Braking)
+# Tunables
 # ----------------------------------------------------------------------------
-BASE_SPEED = 14.0          # Aggressive forward speed (rad/s)
-MIN_APPROACH_SPEED = 2.0   # Safe approach floor before stop (rad/s)
-REVERSE_PULSE_SPEED = -5.0 # Active counter-torque to immediately cancel linear momentum
+BASE_SPEED = 12.0          # High cruise speed (rad/s)
+MIN_APPROACH_SPEED = 1.8   # Approach crawl floor (rad/s)
 
-# Collision Avoidance Thresholds
-FRONT_STOP = 0.108         # Trigger active brake to stop at ~0.06m after momentum (m)
-SLOW_DIST = 0.550          # Extended braking window for high speed (m)
-MAX_VALID = 1.0            # Discard non-finite / out-of-range sensor returns (m)
+# Stopping thresholds (calibrated for 0.22m corridor with front bumper offset)
+FRONT_STOP = 0.090         # Stop and turn distance (m)
+SLOW_DIST = 0.400          # Distance to begin progressive braking (m)
 
-# Gyro heading stabilization during drive
-K_HEAD = 7.0
-K_GYRO = 1.2
-U_LIMIT = 4.0
+# Gyro heading lock (prevents drifting or spinning while moving forward)
+K_HEAD = 4.0               # Proportional heading correction
+K_GYRO = 0.6               # Damping on yaw rate
+U_LIMIT = 2.0              # Max steering correction (rad/s)
 
-# Side wall bumper guard
-SIDE_SAFE = 0.052
-K_SIDE = 45.0
-
-# Rotation parameters
-TURN_RATE_MAX = 6.5        # Rapid in-place pivot (rad/s)
-TURN_RATE_MIN = 1.5
-TURN_KP = 8.0
-TURN_TOL = math.radians(2.5)
-TURN_ANGLE = math.pi / 2.0
-
-# Timers
-ACTIVE_BRAKE_TIME = 0.035  # Duration of reverse torque pulse (s)
-SETTLE_TIME = 0.040        # Quick settle before sampling side sensors (s)
+# Turn tunables
+TURN_RATE_MAX = 5.0        # Rapid rotation body rate (rad/s)
+TURN_RATE_MIN = 1.0        # Creep turn speed for precise landing (rad/s)
+TURN_KP = 6.0              # Turn P-gain
+TURN_TOL = math.radians(2.0)
+TURN_ANGLE = math.pi / 2.0 # 90 degrees
 
 # ----------------------------------------------------------------------------
 # State Machine
 # ----------------------------------------------------------------------------
-# States: 'DRIVE', 'ACTIVE_BRAKE', 'SAMPLE_SENSORS', 'TURN'
-state = {
-    "mode": "DRIVE",
-    "t_mode": 0.0,
-    "heading": 0.0,
-    "angle": 0.0,
-    "target": 0.0,
-    "bias": 0.0,
-}
-
-
-def _valid(x):
-    return x is not None and math.isfinite(x) and 0.0 < x < MAX_VALID
-
-
-def _val(x):
-    return x if _valid(x) else MAX_VALID
-
-
-def _clamp(x, lo, hi):
-    return max(lo, min(hi, x))
+# Modes: 'DRIVE', 'STOP_AND_DECIDE', 'TURN'
+mode = 'DRIVE'
+accumulated_yaw = 0.0
+target_angle = 0.0
+stop_timer = 0
 
 
 def _mqtt_client():
@@ -89,102 +63,83 @@ def _mqtt_client():
 
 
 def on_message(client, userdata, msg):
+    global mode, accumulated_yaw, target_angle, stop_timer
+
     data = json.loads(msg.payload.decode())
 
-    fl = data["fl"]
-    fr = data["fr"]
-    sl = data["sl"]
-    sr = data["sr"]
-    yaw_rate = data["gyro"][2]
-    dt = data["dt"]
+    fl = float(data["fl"])
+    fr = float(data["fr"])
+    sl = float(data["sl"])
+    sr = float(data["sr"])
+    yaw_rate = float(data["gyro"][2])
+    dt = float(data["dt"]) if data.get("dt") and data["dt"] > 0 else 0.002
 
-    if dt is None or dt <= 0:
-        dt = 0.002
-
-    rate = yaw_rate - state["bias"]
-    front = min(_val(fl), _val(fr))
-    mode = state["mode"]
+    front_dist = min(fl, fr)
     left_vel = 0.0
     right_vel = 0.0
 
-    if mode == "DRIVE":
-        state["heading"] += rate * dt
+    if mode == 'DRIVE':
+        # Integrate heading to hold a straight line
+        accumulated_yaw += yaw_rate * dt
 
-        if front <= FRONT_STOP:
-            # Wall reached: trigger active counter-brake to instantly kill forward inertia
-            state["mode"] = "ACTIVE_BRAKE"
-            state["t_mode"] = 0.0
-            left_vel = REVERSE_PULSE_SPEED
-            right_vel = REVERSE_PULSE_SPEED
+        if front_dist <= FRONT_STOP:
+            # Wall detected: cut speed immediately to settle
+            mode = 'STOP_AND_DECIDE'
+            stop_timer = 0
+            left_vel = 0.0
+            right_vel = 0.0
         else:
-            # Smooth progressive deceleration approaching the obstacle
-            if front < SLOW_DIST:
-                ratio = (front - FRONT_STOP) / (SLOW_DIST - FRONT_STOP)
+            # Progressive deceleration as robot approaches the wall
+            if front_dist < SLOW_DIST:
+                ratio = (front_dist - FRONT_STOP) / (SLOW_DIST - FRONT_STOP)
                 ratio = max(0.0, min(1.0, ratio))
-                speed = MIN_APPROACH_SPEED + (ratio ** 1.3) * (BASE_SPEED - MIN_APPROACH_SPEED)
+                speed = MIN_APPROACH_SPEED + (ratio ** 1.2) * (BASE_SPEED - MIN_APPROACH_SPEED)
             else:
                 speed = BASE_SPEED
 
-            # Heading hold via gyro
-            u = -K_HEAD * state["heading"] - K_GYRO * rate
+            # Active heading hold along the straight axis
+            steering = (-K_HEAD * accumulated_yaw) - (K_GYRO * yaw_rate)
+            steering = max(-U_LIMIT, min(U_LIMIT, steering))
 
-            # Side clearance repulsion
-            push = 0.0
-            if _valid(sl) and sl < SIDE_SAFE:
-                push -= K_SIDE * (SIDE_SAFE - sl)
-            if _valid(sr) and sr < SIDE_SAFE:
-                push += K_SIDE * (SIDE_SAFE - sr)
+            left_vel = speed - steering
+            right_vel = speed + steering
 
-            if push != 0.0:
-                state["heading"] = 0.0
-            u = _clamp(u + push, -U_LIMIT, U_LIMIT)
-
-            left_vel = speed - u
-            right_vel = speed + u
-
-    elif mode == "ACTIVE_BRAKE":
-        state["t_mode"] += dt
-        left_vel = REVERSE_PULSE_SPEED
-        right_vel = REVERSE_PULSE_SPEED
-
-        # After applying counter-torque pulse, switch to zero-velocity settle
-        if state["t_mode"] >= ACTIVE_BRAKE_TIME:
-            state["mode"] = "SAMPLE_SENSORS"
-            state["t_mode"] = 0.0
-            left_vel = 0.0
-            right_vel = 0.0
-
-    elif mode == "SAMPLE_SENSORS":
-        state["t_mode"] += dt
+    elif mode == 'STOP_AND_DECIDE':
+        # Hold zero speed for ~20ms to kill linear momentum and settle sensor readings
         left_vel = 0.0
         right_vel = 0.0
+        stop_timer += 1
 
-        if state["t_mode"] >= SETTLE_TIME:
-            # Measure side distances while stopped and turn toward the open passage
-            left_space = _val(sl)
-            right_space = _val(sr)
+        if stop_timer >= 10:
+            accumulated_yaw = 0.0
 
-            state["target"] = TURN_ANGLE if left_space >= right_space else -TURN_ANGLE
-            state["angle"] = 0.0
-            state["mode"] = "TURN"
+            # Turn toward whichever side has greater open distance
+            if sl >= sr:
+                target_angle = TURN_ANGLE      # Turn Left (+90 deg)
+            else:
+                target_angle = -TURN_ANGLE     # Turn Right (-90 deg)
 
-    elif mode == "TURN":
-        state["angle"] += rate * dt
-        err = state["target"] - state["angle"]
+            mode = 'TURN'
 
-        if abs(err) < TURN_TOL:
-            # Turn complete: instantly launch back into forward drive
-            state["mode"] = "DRIVE"
-            state["heading"] = 0.0
+    elif mode == 'TURN':
+        accumulated_yaw += yaw_rate * dt
+        err = target_angle - accumulated_yaw
+
+        if abs(err) <= TURN_TOL:
+            # Turn completed: reset heading tracker and resume high-speed drive
+            accumulated_yaw = 0.0
+            mode = 'DRIVE'
             left_vel = BASE_SPEED
             right_vel = BASE_SPEED
         else:
             w = math.copysign(
-                _clamp(TURN_KP * abs(err), TURN_RATE_MIN, TURN_RATE_MAX),
+                max(TURN_RATE_MIN, min(TURN_RATE_MAX, TURN_KP * abs(err))),
                 err
             )
-            wheel = w * (TRACK / 2.0) / WHEEL_R
-            left_vel, right_vel = -wheel, wheel
+            # In-place rotation calculation
+            wheel_speed = w * (TRACK / 2.0) / WHEEL_R
+            left_vel = -wheel_speed
+            right_vel = wheel_speed
 
     client.publish(TOPIC_WHEEL_VEL, json.dumps({
         "left": float(left_vel), "right": float(right_vel),
