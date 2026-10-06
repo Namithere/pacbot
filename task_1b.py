@@ -26,7 +26,7 @@ TRACK = 0.092
 # ----------------------------------------------------------------------------
 # Tunables
 # ----------------------------------------------------------------------------
-BASE_SPEED = 10.0          # Controlled high speed (rad/s)
+BASE_SPEED = 22.0          # Controlled high speed (rad/s)
 MIN_APPROACH_SPEED = 1.5   # Creep floor near walls (rad/s)
 
 # Distance thresholds
@@ -71,10 +71,10 @@ def on_message(client, userdata, msg):
 
     data = json.loads(msg.payload.decode())
 
-    fl = float(data["fl"])
-    fr = float(data["fr"])
-    sl = float(data["sl"])
-    sr = float(data["sr"])
+    fl = float(data["sl"])
+    fr = float(data["sr"])
+    sl = float(data["fl"])
+    sr = float(data["fr"])
     yaw_rate = float(data["gyro"][2])
     dt = float(data["dt"]) if data.get("dt") and data["dt"] > 0 else 0.002
 
