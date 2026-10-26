@@ -20,12 +20,9 @@ What you get over MQTT:
 What you send:
   pacbot/wheel_vel  wheel speeds in rad/s - the return value of Solver.step()
 
-As given, this file connects, reads the poses and the pellet, and keeps the
-robot still.
-
 Run:
     ./task_2a_launch                 # terminal 1
-    python3 task_2a_boilerplate.py   # terminal 2
+    python3 task_2a.py               # terminal 2
 """
 import heapq
 import json
@@ -46,14 +43,9 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # us -> sim
 N = 15            # cells per side
 PITCH = 0.22      # m, cell centre to cell centre
 WALL_HALF = 0.005  # m, half the wall thickness
-# Cells are (row, col), as the maze drawing and pacbot/poses use: row 0 at
-# the top, column 0 at the left. As in Task 2B, cell (row, col) is centred
-# at world (col * PITCH, (N - 1 - row) * PITCH) - see cell_centre().
 EXIT = (N - 1, N - 1, 3)  # the only opening in the border: -y side of (14, 14)
 
-# Directions: 0 = +x, 1 = +y, 2 = -x, 3 = -y (the numbering pacbot/poses uses).
-# STEP[d] is the (d_row, d_col) of one cell in direction d: +x is the next
-# column, +y the row above.
+# Directions: 0 = +x, 1 = +y, 2 = -x, 3 = -y
 STEP = ((0, 1), (-1, 0), (0, -1), (1, 0))
 
 DIR_TO_ANGLE = {
@@ -63,7 +55,6 @@ DIR_TO_ANGLE = {
     3: -math.pi / 2,
 }
 
-# Copy of kLayout in maze_2a.cpp - the maze is the same on every launch.
 LAYOUT = (
     "+---+---+---+---+---+---+---+---+---+---+---+---+---+---+---+",
     "|                           |       |               |       |",
@@ -91,7 +82,7 @@ LAYOUT = (
     "|   |   |           |   |               |   |               |",
     "+   +   +---+---+---+   +---+---+---+   +   +---+   +---+   +",
     "|   |       |                   |       |       |       |   |",
-    "+   +   +   +   +   +   +---+   +   +---+---+   +---+   +",
+    "+   +   +   +   +   +   +---+   +   +---+---+   +---+   +   +",
     "|   |   |       |   |           |   |       |   |       |   |",
     "+   +   +---+---+   +   +   +   +   +---+   +   +---+---+   +",
     "|               |           |               |               |",
@@ -100,7 +91,6 @@ LAYOUT = (
 
 
 def _wall_table():
-    """{(row, col, d): True if side d of cell (row, col) is walled}."""
     walls = {}
     for row in range(N):
         for col in range(N):
@@ -116,7 +106,6 @@ WALLS = _wall_table()
 
 
 def cell_centre(cell):
-    """World (x, y) of the centre of cell (row, col)."""
     return cell[1] * PITCH, (N - 1 - cell[0]) * PITCH
 
 
@@ -124,25 +113,13 @@ def inside(row, col):
     return 0 <= row < N and 0 <= col < N
 
 
-def neighbours(cell):
-    """Open neighbouring cells of `cell`, as (direction, cell) pairs."""
-    row, col = cell
-    out = []
-    for d in range(4):
-        n = (row + STEP[d][0], col + STEP[d][1])
-        if not WALLS[row, col, d] and inside(*n):
-            out.append((d, n))
-    return out
-
-
 # ----------------------------------------------------------------- robot
 WHEEL_R = 0.017           # m, wheel radius
 TRACK = 0.078             # m, wheel centre to wheel centre
 TICKS_PER_REV = 360       # encoder ticks per wheel revolution
 M_PER_TICK = 2 * math.pi * WHEEL_R / TICKS_PER_REV
-WHEEL_MAX = 30.0          # rad/s, the simulator's clamp
-AXLE_BACK = 0.033         # m, the wheel axle is this far behind the chassis centre
-NO_HIT = 2.0              # m, what a ToF reads when nothing is within its 2 m range
+WHEEL_MAX = 30.0          # rad/s, simulator clamp
+AXLE_BACK = 0.033         # m, wheel axle distance behind chassis centre
 
 SENSORS = (
     ("sl", (-0.005, 0.034), 0.0),
@@ -153,7 +130,6 @@ SENSORS = (
 
 
 def wrap(a):
-    """Fold an angle into (-pi, pi]."""
     return math.atan2(math.sin(a), math.cos(a))
 
 
@@ -162,28 +138,30 @@ def clamp(x, lo, hi):
 
 
 def wheels(v, omega):
-    """(left, right) wheel speeds in rad/s for forward speed v (m/s) and turn rate omega."""
     left = (v - omega * TRACK / 2.0) / WHEEL_R
     right = (v + omega * TRACK / 2.0) / WHEEL_R
     return clamp(left, -WHEEL_MAX, WHEEL_MAX), clamp(right, -WHEEL_MAX, WHEEL_MAX)
 
 
 # ------------------------------------------------------- controller tuning
-V_CRUISE = 0.30
-V_MIN = 0.04
-A_ACC = 1.0
-A_DEC = 0.8
-A_DEC_MAX = 1.5
-STOP_TOL = 0.004
-KH = 5.0
-KL = 4.0
-MAX_REF = 0.30
-KP_TURN = 5.0
-W_TURN_MAX = 3.0
-W_TURN_MIN = 0.4
-TURN_TOL = math.radians(1.5)
-GYRO_TOL = 0.08
-SETTLE_FRAMES = 10
+V_CRUISE = 0.32        # m/s, forward cruising speed
+V_MIN = 0.04           # m/s, creep speed near stop point
+A_ACC = 1.2            # m/s^2, acceleration ramp
+A_DEC = 1.0            # m/s^2, braking profile
+A_DEC_MAX = 1.8        # m/s^2, max commanded deceleration
+STOP_TOL = 0.005       # m, stop distance tolerance
+
+KH = 6.0               # heading P gain on straight run
+KL = 5.0               # lateral P gain on straight run
+MAX_REF = 0.30         # rad, lane heading offset clamp
+
+KP_TURN = 7.0          # turn P gain
+KD_TURN = 0.45         # turn D (gyro damping) gain to stop overshoots
+W_TURN_MAX = 3.2       # rad/s, max turn speed
+W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stalling
+TURN_TOL = math.radians(2.0)   # 2.0 degrees target tolerance
+GYRO_TOL = 0.20        # rad/s, stabilized threshold
+
 HALF_GAP = (PITCH - 2 * WALL_HALF) / 2
 WALL_NEAR = 0.19
 SIDE_OFF = 0.005
@@ -301,8 +279,6 @@ class Solver:
         d_left = (ticks[0] - self.prev_ticks[0]) * M_PER_TICK
         d_right = (ticks[1] - self.prev_ticks[1]) * M_PER_TICK
         self.prev_ticks = ticks
-
-        # Turn rate from IMU (z-axis)
         turn_rate = s["gyro"][2]
 
         if self.done or self.spawn is None or self.pellet is None:
@@ -316,15 +292,16 @@ class Solver:
         if self.phase == "settle" and d_left == 0 and d_right == 0:
             self.gyro_bias += 0.1 * (turn_rate - self.gyro_bias)
 
-        # Gyro integration with bias compensation
-        dth = (turn_rate - self.gyro_bias) * dt
+        # Gyro odometry with calibrated bias removal
+        omega = turn_rate - self.gyro_bias
+        dth = omega * dt
         mid = self.th + 0.5 * dth
         ds = 0.5 * (d_left + d_right)
         self.x += ds * math.cos(mid)
         self.y += ds * math.sin(mid)
         self.th = wrap(self.th + dth)
 
-        return self._control(s, turn_rate - self.gyro_bias)
+        return self._control(s, omega)
 
     def _start(self):
         d, cell = self.spawn
@@ -336,10 +313,10 @@ class Solver:
         self.y = cy - AXLE_BACK * math.sin(self.th)
         self.queue = [("run", 0)] + list(self.actions)
         self.phase = "settle"
-        self.settle = 50
+        self.settle = 40
         self.v_cmd = 0.0
 
-    def _control(self, s, gyro):
+    def _control(self, s, omega):
         while self.phase == "idle":
             if not self.queue:
                 self.phase = "finished"
@@ -353,7 +330,7 @@ class Solver:
         if self.phase == "run":
             return self._run(s)
         if self.phase == "turn":
-            return self._turn(gyro)
+            return self._turn(omega)
         return 0.0, 0.0
 
     def _begin(self, action):
@@ -377,24 +354,34 @@ class Solver:
             self.phase = "run"
             self.log(f"run {val} -> cell {tgt}")
 
-    def _turn(self, gyro):
+    def _turn(self, omega):
         err = wrap(self.turn_target - self.th)
-        if abs(err) < TURN_TOL and abs(gyro) < GYRO_TOL:
-            self.ok_count += 1
+
+        # Stable check: within tolerance and essentially stationary
+        if abs(err) < TURN_TOL:
+            if abs(omega) < GYRO_TOL:
+                self.ok_count += 1
+            else:
+                self.ok_count = 0
         else:
             self.ok_count = 0
 
-        if self.ok_count >= 5:
+        # Lock turn immediately after staying on heading for 2 frames
+        if self.ok_count >= 2:
             self.heading = self.turn_dir
-            self.th = self.turn_target  # Pin heading to target to eliminate residual drift
+            self.th = self.turn_target  # Pin exact heading to kill odometry drift
             self.phase = "settle"
-            self.settle = SETTLE_FRAMES
+            self.settle = 3             # 30 ms brief stabilization
             return 0.0, 0.0
 
-        if abs(err) < TURN_TOL:
-            return 0.0, 0.0
+        # PD turn control: P drives toward angle, D (gyro damping) actively brakes
+        w = KP_TURN * err - KD_TURN * omega
+        w = clamp(w, -W_TURN_MAX, W_TURN_MAX)
 
-        w = math.copysign(clamp(KP_TURN * abs(err), W_TURN_MIN, W_TURN_MAX), err)
+        # Enforce minimum turning speed ONLY outside 1.7 degrees to eliminate hunting
+        if abs(err) > 0.03 and abs(w) < W_TURN_MIN:
+            w = math.copysign(W_TURN_MIN, err)
+
         return wheels(0.0, w)
 
     def _correct(self, s, ux, uy, nx, ny, eps):
@@ -427,7 +414,7 @@ class Solver:
     def _run(self, s):
         dt = s["dt"]
         ux, uy = math.cos(self.run_th), math.sin(self.run_th)
-        nx, ny = -uy, ux
+        nx, ny = -uy, ux                      # Normal vector to corridor
         cx, cy = self.run_c
         eps = wrap(self.th - self.run_th)
 
@@ -438,23 +425,26 @@ class Solver:
         lateral = (self.x - cx) * nx + (self.y - cy) * ny
         rem = -along
 
+        # Stop and snap to cell centre
         if rem <= STOP_TOL:
             self.x -= along * ux
             self.y -= along * uy
             self.cell = self.run_cell
-            if abs(eps) < 0.1:
+            if abs(eps) < 0.12:
                 self.th = self.run_th
             self.v_cmd = 0.0
             self.phase = "settle"
-            self.settle = SETTLE_FRAMES
+            self.settle = 3
             return 0.0, 0.0
 
+        # Smooth trapezoidal/deceleration profile
         v_des = clamp(math.sqrt(2 * A_DEC * rem), V_MIN, V_CRUISE)
         if v_des > self.v_cmd:
             self.v_cmd = min(v_des, self.v_cmd + A_ACC * dt)
         else:
             self.v_cmd = max(v_des, self.v_cmd - A_DEC_MAX * dt)
 
+        # Steer strictly down the lane centerline
         ref = self.run_th - clamp(KL * lateral, -MAX_REF, MAX_REF)
         omega = KH * wrap(ref - self.th)
         return wheels(self.v_cmd, omega)
