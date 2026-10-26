@@ -33,11 +33,11 @@ import paho.mqtt.client as mqtt
 # ------------------------------------------------------------------ MQTT
 MQTT_HOST = "localhost"
 MQTT_PORT = 1883
-TOPIC_SENSORS = "pacbot/sensors"      # sim -> us, every physics step
-TOPIC_POSES = "pacbot/poses"          # sim -> us, once, retained: robot spawn pose
-TOPIC_PELLETS = "pacbot/pellets"      # sim -> us, once, retained: pellet pose
-TOPIC_RESULT = "pacbot/result"        # sim -> us, once, when the run ends
-TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # us -> sim
+TOPIC_SENSORS = "pacbot/sensors"
+TOPIC_POSES = "pacbot/poses"
+TOPIC_PELLETS = "pacbot/pellets"
+TOPIC_RESULT = "pacbot/result"
+TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 
 # ------------------------------------------------------------------ maze
 N = 15            # cells per side
@@ -143,31 +143,31 @@ def wheels(v, omega):
 
 
 # ------------------------------------------------------- controller tuning
-V_CRUISE = 0.28        # m/s, controlled straight cruising speed
+V_CRUISE = 0.28        # m/s, cruising speed
 V_MIN = 0.03           # m/s, creep speed near stop point
 A_ACC = 1.0            # m/s^2, acceleration ramp
-A_DEC = 1.2            # m/s^2, decisive braking
-A_DEC_MAX = 2.0        # m/s^2, maximum commanded deceleration
+A_DEC = 1.2            # m/s^2, deceleration profile
+A_DEC_MAX = 2.0        # m/s^2, max commanded deceleration
 STOP_TOL = 0.005       # m, stop distance tolerance
 
 KH = 6.0               # heading P gain on straight run
-KL = 6.0               # lateral gain from wall sensors
-MAX_REF = 0.22         # rad, clamp lateral steer angle to avoid over-correcting
+KL = 4.5               # lateral gain from wall sensors
+MAX_REF = 0.15         # rad (~8.5 deg), max steer offset to prevent wall grazing
 
 KP_TURN = 7.0          # turn P gain
 KD_TURN = 0.45         # turn D (gyro damping) gain
 W_TURN_MAX = 3.0       # rad/s, max turn speed
-W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stall
-TURN_TOL = math.radians(2.0)   # 2.0 degrees target tolerance
-GYRO_TOL = 0.15        # rad/s, stabilized threshold
+W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stalling
+TURN_TOL = math.radians(2.0)
+GYRO_TOL = 0.15
 
 HALF_GAP = (PITCH - 2 * WALL_HALF) / 2  # 0.105 m
-WALL_NEAR = 0.165      # threshold for side wall detection
+WALL_NEAR = 0.155      # threshold to consider a side wall in range
 SIDE_OFF = 0.005       # m, sensor offset from centerline
-TARGET_WALL = HALF_GAP - SIDE_OFF       # 0.100 m nominal distance to wall face
+TARGET_WALL = HALF_GAP - SIDE_OFF       # 0.100 m
 SENSOR_ARM = AXLE_BACK + 0.036          # 0.069 m ahead of axle
 FRONT_ARM = AXLE_BACK - 0.005           # 0.028 m ahead of axle
-FRONT_RANGE = 0.8
+FRONT_STOP_DIST = HALF_GAP - FRONT_ARM  # 0.077 m
 
 
 # ============================================================== planning
@@ -380,71 +380,81 @@ class Solver:
     def _run(self, s):
         dt = s["dt"]
         ux, uy = math.cos(self.run_th), math.sin(self.run_th)
-        nx, ny = -uy, ux                      # Left-hand normal of lane
+        nx, ny = -uy, ux                      # Left-hand normal
         cx, cy = self.run_c
         eps = wrap(self.th - self.run_th)
 
         along = (self.x - cx) * ux + (self.y - cy) * uy
         rem = -along
 
+        # Front wall distance override prevents overshooting into end-walls
+        if self.run_front_wall:
+            r_front = min(s["sl"], s["sr"]) * math.cos(eps)
+            if r_front < 0.35:
+                front_rem = r_front - FRONT_STOP_DIST
+                rem = max(0.0, front_rem)
+
         # Stop threshold
         if rem <= STOP_TOL:
-            self.x = cx
-            self.y = cy
+            # Snap along-track coordinate to lane stop point
+            self.x -= along * ux
+            self.y -= along * uy
             self.cell = self.run_cell
             if abs(eps) < 0.12:
                 self.th = self.run_th
             self.v_cmd = 0.0
             self.phase = "settle"
-            self.settle = 3
+            self.settle = 2
             return 0.0, 0.0
 
-        # ---------------- Real-time reactive wall tracking
+        # Current cell according to odometry
+        crow = clamp(int(round(N - 1 - self.y / PITCH)), 0, N - 1)
+        ccol = clamp(int(round(self.x / PITCH)), 0, N - 1)
+
+        d = self.heading
+        left_d = (d + 1) % 4
+        right_d = (d + 3) % 4
+
+        # Verify wall existence using the layout map
+        has_left_wall = WALLS.get((crow, ccol, left_d), False)
+        has_right_wall = WALLS.get((crow, ccol, right_d), False)
+
         fl, fr = s["fl"], s["fr"]
-        has_left = fl < WALL_NEAR
-        has_right = fr < WALL_NEAR
-        lateral_sensor = None
+        fl_valid = (fl < WALL_NEAR) and has_left_wall
+        fr_valid = (fr < WALL_NEAR) and has_right_wall
 
-        if has_left and has_right:
-            # Both walls present: center directly between them
-            lateral_sensor = 0.5 * (fr - fl) - SENSOR_ARM * math.sin(eps)
-        elif has_left and abs(eps) < 0.10:
-            # Track left wall distance
-            lateral_sensor = (TARGET_WALL - fl) - SENSOR_ARM * math.sin(eps)
-        elif has_right and abs(eps) < 0.10:
-            # Track right wall distance
-            lateral_sensor = (fr - TARGET_WALL) - SENSOR_ARM * math.sin(eps)
+        # Wall-based lateral offset calculation
+        lat_sensor = None
+        if fl_valid and fr_valid:
+            # Both walls present: center strictly between them
+            lat_sensor = 0.5 * (fr - fl) - SENSOR_ARM * math.sin(eps)
+        elif fl_valid and abs(eps) < 0.08 and rem > 0.04:
+            # Only left wall verified by map
+            lat_sensor = (TARGET_WALL - fl) - SENSOR_ARM * math.sin(eps)
+        elif fr_valid and abs(eps) < 0.08 and rem > 0.04:
+            # Only right wall verified by map
+            lat_sensor = (fr - TARGET_WALL) - SENSOR_ARM * math.sin(eps)
 
-        # Odometry lateral distance
         odom_lat = (self.x - cx) * nx + (self.y - cy) * ny
 
-        if lateral_sensor is not None:
-            lat_err = clamp(lateral_sensor, -0.05, 0.05)
-            # Sync dead reckoning with true sensor measurement
-            self.x += 0.20 * (lat_err - odom_lat) * nx
-            self.y += 0.20 * (lat_err - odom_lat) * ny
+        if lat_sensor is not None:
+            lat_err = clamp(lat_sensor, -0.035, 0.035)
+            # Gently nudge odometry to prevent drift
+            self.x += 0.06 * (lat_err - odom_lat) * nx
+            self.y += 0.06 * (lat_err - odom_lat) * ny
+            effective_lat = lat_err
         else:
-            lat_err = odom_lat
+            effective_lat = odom_lat
 
-        # Front wall distance correction
-        if self.run_front_wall:
-            r = min(s["sl"], s["sr"]) * math.cos(eps)
-            if r < FRONT_RANGE:
-                meas = (HALF_GAP - FRONT_ARM) - r
-                cur = (self.x - cx) * ux + (self.y - cy) * uy
-                k = 0.30 * (meas - cur)
-                self.x += k * ux
-                self.y += k * uy
-
-        # Speed profile
+        # Deceleration profile
         v_des = clamp(math.sqrt(2 * A_DEC * rem), V_MIN, V_CRUISE)
         if v_des > self.v_cmd:
             self.v_cmd = min(v_des, self.v_cmd + A_ACC * dt)
         else:
             self.v_cmd = max(v_des, self.v_cmd - A_DEC_MAX * dt)
 
-        # Active wall centering steering
-        ref = self.run_th - clamp(KL * lat_err, -MAX_REF, MAX_REF)
+        # Centerline lane keeping
+        ref = self.run_th - clamp(KL * effective_lat, -MAX_REF, MAX_REF)
         omega = KH * wrap(ref - self.th)
         return wheels(self.v_cmd, omega)
 
