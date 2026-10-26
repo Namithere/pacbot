@@ -45,7 +45,6 @@ PITCH = 0.22      # m, cell centre to cell centre
 WALL_HALF = 0.005  # m, half the wall thickness
 EXIT = (N - 1, N - 1, 3)  # the only opening in the border: -y side of (14, 14)
 
-# Directions: 0 = +x, 1 = +y, 2 = -x, 3 = -y
 STEP = ((0, 1), (-1, 0), (0, -1), (1, 0))
 
 DIR_TO_ANGLE = {
@@ -82,7 +81,7 @@ LAYOUT = (
     "|   |   |           |   |               |   |               |",
     "+   +   +---+---+---+   +---+---+---+   +   +---+   +---+   +",
     "|   |       |                   |       |       |       |   |",
-    "+   +   +   +   +   +   +---+   +   +---+---+   +---+   +   +",
+    "+   +   +   +   +   +   +---+   +   +---+---+   +---+   +",
     "|   |   |       |   |           |   |       |   |       |   |",
     "+   +   +---+---+   +   +   +   +   +---+   +   +---+---+   +",
     "|               |           |               |               |",
@@ -95,10 +94,10 @@ def _wall_table():
     for row in range(N):
         for col in range(N):
             r, c = 2 * row + 1, 4 * col
-            walls[row, col, 0] = LAYOUT[r][c + 4] == "|"                # +x: right
-            walls[row, col, 1] = LAYOUT[r - 1][c + 1:c + 4] == "---"    # +y: above
-            walls[row, col, 2] = LAYOUT[r][c] == "|"                    # -x: left
-            walls[row, col, 3] = LAYOUT[r + 1][c + 1:c + 4] == "---"    # -y: below
+            walls[row, col, 0] = LAYOUT[r][c + 4] == "|"
+            walls[row, col, 1] = LAYOUT[r - 1][c + 1:c + 4] == "---"
+            walls[row, col, 2] = LAYOUT[r][c] == "|"
+            walls[row, col, 3] = LAYOUT[r + 1][c + 1:c + 4] == "---"
     return walls
 
 
@@ -144,31 +143,31 @@ def wheels(v, omega):
 
 
 # ------------------------------------------------------- controller tuning
-V_CRUISE = 0.32        # m/s, forward cruising speed
-V_MIN = 0.04           # m/s, creep speed near stop point
-A_ACC = 1.2            # m/s^2, acceleration ramp
-A_DEC = 1.0            # m/s^2, braking profile
-A_DEC_MAX = 1.8        # m/s^2, max commanded deceleration
+V_CRUISE = 0.28        # m/s, controlled straight cruising speed
+V_MIN = 0.03           # m/s, creep speed near stop point
+A_ACC = 1.0            # m/s^2, acceleration ramp
+A_DEC = 1.2            # m/s^2, decisive braking
+A_DEC_MAX = 2.0        # m/s^2, maximum commanded deceleration
 STOP_TOL = 0.005       # m, stop distance tolerance
 
 KH = 6.0               # heading P gain on straight run
 KL = 5.0               # lateral P gain on straight run
-MAX_REF = 0.30         # rad, lane heading offset clamp
+MAX_REF = 0.25         # rad, clamp lateral steer to avoid swerving
 
 KP_TURN = 7.0          # turn P gain
-KD_TURN = 0.45         # turn D (gyro damping) gain to stop overshoots
-W_TURN_MAX = 3.2       # rad/s, max turn speed
-W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stalling
+KD_TURN = 0.45         # turn D (gyro damping) gain
+W_TURN_MAX = 3.0       # rad/s, max turn speed
+W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stall
 TURN_TOL = math.radians(2.0)   # 2.0 degrees target tolerance
-GYRO_TOL = 0.20        # rad/s, stabilized threshold
+GYRO_TOL = 0.15        # rad/s, stabilized threshold
 
 HALF_GAP = (PITCH - 2 * WALL_HALF) / 2
-WALL_NEAR = 0.19
+WALL_NEAR = 0.16       # tighter threshold so openings register cleanly as open
 SIDE_OFF = 0.005
 SENSOR_ARM = AXLE_BACK + 0.036
 FRONT_ARM = AXLE_BACK - 0.005
 FRONT_RANGE = 0.8
-LAT_GAIN = 0.10
+LAT_GAIN = 0.08        # conservative blend
 FWD_GAIN = 0.30
 
 
@@ -292,7 +291,6 @@ class Solver:
         if self.phase == "settle" and d_left == 0 and d_right == 0:
             self.gyro_bias += 0.1 * (turn_rate - self.gyro_bias)
 
-        # Gyro odometry with calibrated bias removal
         omega = turn_rate - self.gyro_bias
         dth = omega * dt
         mid = self.th + 0.5 * dth
@@ -357,7 +355,6 @@ class Solver:
     def _turn(self, omega):
         err = wrap(self.turn_target - self.th)
 
-        # Stable check: within tolerance and essentially stationary
         if abs(err) < TURN_TOL:
             if abs(omega) < GYRO_TOL:
                 self.ok_count += 1
@@ -366,34 +363,37 @@ class Solver:
         else:
             self.ok_count = 0
 
-        # Lock turn immediately after staying on heading for 2 frames
+        # Complete turn once settled on target
         if self.ok_count >= 2:
             self.heading = self.turn_dir
-            self.th = self.turn_target  # Pin exact heading to kill odometry drift
+            self.th = self.turn_target
             self.phase = "settle"
-            self.settle = 3             # 30 ms brief stabilization
+            self.settle = 2
             return 0.0, 0.0
 
-        # PD turn control: P drives toward angle, D (gyro damping) actively brakes
+        # PD control with damping to prevent overshoot
         w = KP_TURN * err - KD_TURN * omega
         w = clamp(w, -W_TURN_MAX, W_TURN_MAX)
 
-        # Enforce minimum turning speed ONLY outside 1.7 degrees to eliminate hunting
-        if abs(err) > 0.03 and abs(w) < W_TURN_MIN:
+        if abs(err) > 0.04 and abs(w) < W_TURN_MIN:
             w = math.copysign(W_TURN_MIN, err)
 
         return wheels(0.0, w)
 
-    def _correct(self, s, ux, uy, nx, ny, eps):
+    def _correct(self, s, ux, uy, nx, ny, eps, rem):
         cx, cy = self.run_c
         fl, fr = s["fl"], s["fr"]
+
+        # When nearing the target stop cell, ignore single-wall measurements
+        # so openings/junctions do not corrupt the lateral axis.
         e = None
         if fl < WALL_NEAR and fr < WALL_NEAR:
             e = 0.5 * (fr - fl)
-        elif fl < WALL_NEAR:
-            e = (HALF_GAP - SIDE_OFF) - fl
-        elif fr < WALL_NEAR:
-            e = fr - (HALF_GAP - SIDE_OFF)
+        elif rem > 0.08:  # only apply single-wall guidance mid-corridor
+            if fl < WALL_NEAR and abs(eps) < 0.05:
+                e = (HALF_GAP - SIDE_OFF) - fl
+            elif fr < WALL_NEAR and abs(eps) < 0.05:
+                e = fr - (HALF_GAP - SIDE_OFF)
 
         if e is not None:
             e -= SENSOR_ARM * math.sin(eps)
@@ -402,6 +402,7 @@ class Solver:
             self.x += k * nx
             self.y += k * ny
 
+        # Front wall distance correction
         if self.run_front_wall:
             r = min(s["sl"], s["sr"]) * math.cos(eps)
             if r < FRONT_RANGE:
@@ -414,21 +415,23 @@ class Solver:
     def _run(self, s):
         dt = s["dt"]
         ux, uy = math.cos(self.run_th), math.sin(self.run_th)
-        nx, ny = -uy, ux                      # Normal vector to corridor
+        nx, ny = -uy, ux
         cx, cy = self.run_c
         eps = wrap(self.th - self.run_th)
 
-        if abs(eps) < 0.15:
-            self._correct(s, ux, uy, nx, ny, eps)
-
         along = (self.x - cx) * ux + (self.y - cy) * uy
-        lateral = (self.x - cx) * nx + (self.y - cy) * ny
         rem = -along
 
-        # Stop and snap to cell centre
+        # Run sensor fusion corrections
+        if abs(eps) < 0.15:
+            self._correct(s, ux, uy, nx, ny, eps, rem)
+
+        lateral = (self.x - cx) * nx + (self.y - cy) * ny
+
+        # Stop threshold
         if rem <= STOP_TOL:
-            self.x -= along * ux
-            self.y -= along * uy
+            self.x = cx
+            self.y = cy
             self.cell = self.run_cell
             if abs(eps) < 0.12:
                 self.th = self.run_th
@@ -437,14 +440,14 @@ class Solver:
             self.settle = 3
             return 0.0, 0.0
 
-        # Smooth trapezoidal/deceleration profile
+        # Braking profile
         v_des = clamp(math.sqrt(2 * A_DEC * rem), V_MIN, V_CRUISE)
         if v_des > self.v_cmd:
             self.v_cmd = min(v_des, self.v_cmd + A_ACC * dt)
         else:
             self.v_cmd = max(v_des, self.v_cmd - A_DEC_MAX * dt)
 
-        # Steer strictly down the lane centerline
+        # Steer towards corridor centerline
         ref = self.run_th - clamp(KL * lateral, -MAX_REF, MAX_REF)
         omega = KH * wrap(ref - self.th)
         return wheels(self.v_cmd, omega)
