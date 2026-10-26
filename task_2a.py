@@ -40,10 +40,10 @@ TOPIC_RESULT = "pacbot/result"
 TOPIC_WHEEL_VEL = "pacbot/wheel_vel"
 
 # ------------------------------------------------------------------ maze
-N = 15            # cells per side
-PITCH = 0.22      # m, cell centre to cell centre
-WALL_HALF = 0.005  # m, half the wall thickness
-EXIT = (N - 1, N - 1, 3)  # the only opening in the border: -y side of (14, 14)
+N = 15
+PITCH = 0.22
+WALL_HALF = 0.005
+EXIT = (N - 1, N - 1, 3)
 
 STEP = ((0, 1), (-1, 0), (0, -1), (1, 0))
 
@@ -113,12 +113,12 @@ def inside(row, col):
 
 
 # ----------------------------------------------------------------- robot
-WHEEL_R = 0.017           # m, wheel radius
-TRACK = 0.078             # m, wheel centre to wheel centre
-TICKS_PER_REV = 360       # encoder ticks per wheel revolution
+WHEEL_R = 0.017
+TRACK = 0.078
+TICKS_PER_REV = 360
 M_PER_TICK = 2 * math.pi * WHEEL_R / TICKS_PER_REV
-WHEEL_MAX = 30.0          # rad/s, simulator clamp
-AXLE_BACK = 0.033         # m, wheel axle distance behind chassis centre
+WHEEL_MAX = 30.0
+AXLE_BACK = 0.033
 
 SENSORS = (
     ("sl", (-0.005, 0.034), 0.0),
@@ -143,30 +143,30 @@ def wheels(v, omega):
 
 
 # ------------------------------------------------------- controller tuning
-V_CRUISE = 0.28        # m/s, cruising speed
-V_MIN = 0.03           # m/s, creep speed near stop point
-A_ACC = 1.0            # m/s^2, acceleration ramp
-A_DEC = 1.2            # m/s^2, deceleration profile
-A_DEC_MAX = 2.0        # m/s^2, max commanded deceleration
-STOP_TOL = 0.005       # m, stop distance tolerance
+V_CRUISE = 0.35        # Snappy, purposeful forward speed
+V_MIN = 0.06           # Prevent crawling near the stop point
+A_ACC = 1.6            # Fast acceleration
+A_DEC = 1.6            # Decisive braking
+A_DEC_MAX = 2.4
+STOP_TOL = 0.008       # Stop cleanly at the cell center
 
-KH = 6.0               # heading P gain on straight run
-KL = 4.5               # lateral gain from wall sensors
-MAX_REF = 0.15         # rad (~8.5 deg), max steer offset to prevent wall grazing
+KH = 7.0               # Strong heading P gain to keep straight
+KL = 3.0               # Gentle lateral centering gain
+MAX_LAT_OMEGA = 0.40   # Max heading bias added for centering (prevents diagonal drift)
 
-KP_TURN = 7.0          # turn P gain
-KD_TURN = 0.45         # turn D (gyro damping) gain
-W_TURN_MAX = 3.0       # rad/s, max turn speed
-W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stalling
+KP_TURN = 7.5
+KD_TURN = 0.45
+W_TURN_MAX = 3.2
+W_TURN_MIN = 0.40
 TURN_TOL = math.radians(2.0)
 GYRO_TOL = 0.15
 
 HALF_GAP = (PITCH - 2 * WALL_HALF) / 2  # 0.105 m
-WALL_NEAR = 0.155      # threshold to consider a side wall in range
-SIDE_OFF = 0.005       # m, sensor offset from centerline
+WALL_NEAR = 0.145      # Clear detection of true nearby side walls
+SIDE_OFF = 0.005
 TARGET_WALL = HALF_GAP - SIDE_OFF       # 0.100 m
-SENSOR_ARM = AXLE_BACK + 0.036          # 0.069 m ahead of axle
-FRONT_ARM = AXLE_BACK - 0.005           # 0.028 m ahead of axle
+SENSOR_ARM = AXLE_BACK + 0.036
+FRONT_ARM = AXLE_BACK - 0.005
 FRONT_STOP_DIST = HALF_GAP - FRONT_ARM  # 0.077 m
 
 
@@ -310,7 +310,7 @@ class Solver:
         self.y = cy - AXLE_BACK * math.sin(self.th)
         self.queue = [("run", 0)] + list(self.actions)
         self.phase = "settle"
-        self.settle = 40
+        self.settle = 30
         self.v_cmd = 0.0
 
     def _control(self, s, omega):
@@ -366,7 +366,7 @@ class Solver:
             self.heading = self.turn_dir
             self.th = self.turn_target
             self.phase = "settle"
-            self.settle = 2
+            self.settle = 1
             return 0.0, 0.0
 
         w = KP_TURN * err - KD_TURN * omega
@@ -380,82 +380,66 @@ class Solver:
     def _run(self, s):
         dt = s["dt"]
         ux, uy = math.cos(self.run_th), math.sin(self.run_th)
-        nx, ny = -uy, ux                      # Left-hand normal
+        nx, ny = -uy, ux
         cx, cy = self.run_c
         eps = wrap(self.th - self.run_th)
 
         along = (self.x - cx) * ux + (self.y - cy) * uy
         rem = -along
 
-        # Front wall distance override prevents overshooting into end-walls
+        # Use front wall measurement to prevent overshoot
         if self.run_front_wall:
             r_front = min(s["sl"], s["sr"]) * math.cos(eps)
-            if r_front < 0.35:
+            if r_front < 0.40:
                 front_rem = r_front - FRONT_STOP_DIST
                 rem = max(0.0, front_rem)
 
         # Stop threshold
         if rem <= STOP_TOL:
-            # Snap along-track coordinate to lane stop point
             self.x -= along * ux
             self.y -= along * uy
             self.cell = self.run_cell
-            if abs(eps) < 0.12:
-                self.th = self.run_th
+            self.th = self.run_th  # Guarantee perfectly straight heading before turn
             self.v_cmd = 0.0
             self.phase = "settle"
-            self.settle = 2
+            self.settle = 1
             return 0.0, 0.0
 
-        # Current cell according to odometry
+        # Sensor-based lateral correction only mid-corridor
+        fl, fr = s["fl"], s["fr"]
         crow = clamp(int(round(N - 1 - self.y / PITCH)), 0, N - 1)
         ccol = clamp(int(round(self.x / PITCH)), 0, N - 1)
-
         d = self.heading
-        left_d = (d + 1) % 4
-        right_d = (d + 3) % 4
+        has_left_wall = WALLS.get((crow, ccol, (d + 1) % 4), False)
+        has_right_wall = WALLS.get((crow, ccol, (d + 3) % 4), False)
 
-        # Verify wall existence using the layout map
-        has_left_wall = WALLS.get((crow, ccol, left_d), False)
-        has_right_wall = WALLS.get((crow, ccol, right_d), False)
-
-        fl, fr = s["fl"], s["fr"]
         fl_valid = (fl < WALL_NEAR) and has_left_wall
         fr_valid = (fr < WALL_NEAR) and has_right_wall
 
-        # Wall-based lateral offset calculation
-        lat_sensor = None
-        if fl_valid and fr_valid:
-            # Both walls present: center strictly between them
-            lat_sensor = 0.5 * (fr - fl) - SENSOR_ARM * math.sin(eps)
-        elif fl_valid and abs(eps) < 0.08 and rem > 0.04:
-            # Only left wall verified by map
-            lat_sensor = (TARGET_WALL - fl) - SENSOR_ARM * math.sin(eps)
-        elif fr_valid and abs(eps) < 0.08 and rem > 0.04:
-            # Only right wall verified by map
-            lat_sensor = (fr - TARGET_WALL) - SENSOR_ARM * math.sin(eps)
-
         odom_lat = (self.x - cx) * nx + (self.y - cy) * ny
+        lat_err = odom_lat
 
-        if lat_sensor is not None:
-            lat_err = clamp(lat_sensor, -0.035, 0.035)
-            # Gently nudge odometry to prevent drift
-            self.x += 0.06 * (lat_err - odom_lat) * nx
-            self.y += 0.06 * (lat_err - odom_lat) * ny
-            effective_lat = lat_err
-        else:
-            effective_lat = odom_lat
+        # Avoid lateral steering near junctions to stay straight
+        if rem > 0.06:
+            if fl_valid and fr_valid:
+                lat_err = 0.5 * (fr - fl) - SENSOR_ARM * math.sin(eps)
+            elif fl_valid and abs(eps) < 0.06:
+                lat_err = (TARGET_WALL - fl) - SENSOR_ARM * math.sin(eps)
+            elif fr_valid and abs(eps) < 0.06:
+                lat_err = (fr - TARGET_WALL) - SENSOR_ARM * math.sin(eps)
 
-        # Deceleration profile
+        lat_err = clamp(lat_err, -0.035, 0.035)
+
+        # Acceleration and deceleration speed profile
         v_des = clamp(math.sqrt(2 * A_DEC * rem), V_MIN, V_CRUISE)
         if v_des > self.v_cmd:
             self.v_cmd = min(v_des, self.v_cmd + A_ACC * dt)
         else:
             self.v_cmd = max(v_des, self.v_cmd - A_DEC_MAX * dt)
 
-        # Centerline lane keeping
-        ref = self.run_th - clamp(KL * effective_lat, -MAX_REF, MAX_REF)
-        omega = KH * wrap(ref - self.th)
+        # Steer straight along run_th while softly rejecting lateral drift
+        heading_err = wrap(self.run_th - self.th)
+        omega = KH * heading_err - clamp(KL * lat_err, -MAX_LAT_OMEGA, MAX_LAT_OMEGA)
         return wheels(self.v_cmd, omega)
 
 
