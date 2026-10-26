@@ -151,8 +151,8 @@ A_DEC_MAX = 2.0        # m/s^2, maximum commanded deceleration
 STOP_TOL = 0.005       # m, stop distance tolerance
 
 KH = 6.0               # heading P gain on straight run
-KL = 5.0               # lateral P gain on straight run
-MAX_REF = 0.25         # rad, clamp lateral steer to avoid swerving
+KL = 6.0               # lateral gain from wall sensors
+MAX_REF = 0.22         # rad, clamp lateral steer angle to avoid over-correcting
 
 KP_TURN = 7.0          # turn P gain
 KD_TURN = 0.45         # turn D (gyro damping) gain
@@ -161,14 +161,13 @@ W_TURN_MIN = 0.35      # rad/s, min turn speed to prevent stall
 TURN_TOL = math.radians(2.0)   # 2.0 degrees target tolerance
 GYRO_TOL = 0.15        # rad/s, stabilized threshold
 
-HALF_GAP = (PITCH - 2 * WALL_HALF) / 2
-WALL_NEAR = 0.16       # tighter threshold so openings register cleanly as open
-SIDE_OFF = 0.005
-SENSOR_ARM = AXLE_BACK + 0.036
-FRONT_ARM = AXLE_BACK - 0.005
+HALF_GAP = (PITCH - 2 * WALL_HALF) / 2  # 0.105 m
+WALL_NEAR = 0.165      # threshold for side wall detection
+SIDE_OFF = 0.005       # m, sensor offset from centerline
+TARGET_WALL = HALF_GAP - SIDE_OFF       # 0.100 m nominal distance to wall face
+SENSOR_ARM = AXLE_BACK + 0.036          # 0.069 m ahead of axle
+FRONT_ARM = AXLE_BACK - 0.005           # 0.028 m ahead of axle
 FRONT_RANGE = 0.8
-LAT_GAIN = 0.08        # conservative blend
-FWD_GAIN = 0.30
 
 
 # ============================================================== planning
@@ -363,7 +362,6 @@ class Solver:
         else:
             self.ok_count = 0
 
-        # Complete turn once settled on target
         if self.ok_count >= 2:
             self.heading = self.turn_dir
             self.th = self.turn_target
@@ -371,7 +369,6 @@ class Solver:
             self.settle = 2
             return 0.0, 0.0
 
-        # PD control with damping to prevent overshoot
         w = KP_TURN * err - KD_TURN * omega
         w = clamp(w, -W_TURN_MAX, W_TURN_MAX)
 
@@ -380,53 +377,15 @@ class Solver:
 
         return wheels(0.0, w)
 
-    def _correct(self, s, ux, uy, nx, ny, eps, rem):
-        cx, cy = self.run_c
-        fl, fr = s["fl"], s["fr"]
-
-        # When nearing the target stop cell, ignore single-wall measurements
-        # so openings/junctions do not corrupt the lateral axis.
-        e = None
-        if fl < WALL_NEAR and fr < WALL_NEAR:
-            e = 0.5 * (fr - fl)
-        elif rem > 0.08:  # only apply single-wall guidance mid-corridor
-            if fl < WALL_NEAR and abs(eps) < 0.05:
-                e = (HALF_GAP - SIDE_OFF) - fl
-            elif fr < WALL_NEAR and abs(eps) < 0.05:
-                e = fr - (HALF_GAP - SIDE_OFF)
-
-        if e is not None:
-            e -= SENSOR_ARM * math.sin(eps)
-            cur = (self.x - cx) * nx + (self.y - cy) * ny
-            k = LAT_GAIN * (e - cur)
-            self.x += k * nx
-            self.y += k * ny
-
-        # Front wall distance correction
-        if self.run_front_wall:
-            r = min(s["sl"], s["sr"]) * math.cos(eps)
-            if r < FRONT_RANGE:
-                meas = (HALF_GAP - FRONT_ARM) - r
-                cur = (self.x - cx) * ux + (self.y - cy) * uy
-                k = FWD_GAIN * (meas - cur)
-                self.x += k * ux
-                self.y += k * uy
-
     def _run(self, s):
         dt = s["dt"]
         ux, uy = math.cos(self.run_th), math.sin(self.run_th)
-        nx, ny = -uy, ux
+        nx, ny = -uy, ux                      # Left-hand normal of lane
         cx, cy = self.run_c
         eps = wrap(self.th - self.run_th)
 
         along = (self.x - cx) * ux + (self.y - cy) * uy
         rem = -along
-
-        # Run sensor fusion corrections
-        if abs(eps) < 0.15:
-            self._correct(s, ux, uy, nx, ny, eps, rem)
-
-        lateral = (self.x - cx) * nx + (self.y - cy) * ny
 
         # Stop threshold
         if rem <= STOP_TOL:
@@ -440,15 +399,52 @@ class Solver:
             self.settle = 3
             return 0.0, 0.0
 
-        # Braking profile
+        # ---------------- Real-time reactive wall tracking
+        fl, fr = s["fl"], s["fr"]
+        has_left = fl < WALL_NEAR
+        has_right = fr < WALL_NEAR
+        lateral_sensor = None
+
+        if has_left and has_right:
+            # Both walls present: center directly between them
+            lateral_sensor = 0.5 * (fr - fl) - SENSOR_ARM * math.sin(eps)
+        elif has_left and abs(eps) < 0.10:
+            # Track left wall distance
+            lateral_sensor = (TARGET_WALL - fl) - SENSOR_ARM * math.sin(eps)
+        elif has_right and abs(eps) < 0.10:
+            # Track right wall distance
+            lateral_sensor = (fr - TARGET_WALL) - SENSOR_ARM * math.sin(eps)
+
+        # Odometry lateral distance
+        odom_lat = (self.x - cx) * nx + (self.y - cy) * ny
+
+        if lateral_sensor is not None:
+            lat_err = clamp(lateral_sensor, -0.05, 0.05)
+            # Sync dead reckoning with true sensor measurement
+            self.x += 0.20 * (lat_err - odom_lat) * nx
+            self.y += 0.20 * (lat_err - odom_lat) * ny
+        else:
+            lat_err = odom_lat
+
+        # Front wall distance correction
+        if self.run_front_wall:
+            r = min(s["sl"], s["sr"]) * math.cos(eps)
+            if r < FRONT_RANGE:
+                meas = (HALF_GAP - FRONT_ARM) - r
+                cur = (self.x - cx) * ux + (self.y - cy) * uy
+                k = 0.30 * (meas - cur)
+                self.x += k * ux
+                self.y += k * uy
+
+        # Speed profile
         v_des = clamp(math.sqrt(2 * A_DEC * rem), V_MIN, V_CRUISE)
         if v_des > self.v_cmd:
             self.v_cmd = min(v_des, self.v_cmd + A_ACC * dt)
         else:
             self.v_cmd = max(v_des, self.v_cmd - A_DEC_MAX * dt)
 
-        # Steer towards corridor centerline
-        ref = self.run_th - clamp(KL * lateral, -MAX_REF, MAX_REF)
+        # Active wall centering steering
+        ref = self.run_th - clamp(KL * lat_err, -MAX_REF, MAX_REF)
         omega = KH * wrap(ref - self.th)
         return wheels(self.v_cmd, omega)
 
