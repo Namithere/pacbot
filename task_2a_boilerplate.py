@@ -43,14 +43,9 @@ TOPIC_WHEEL_VEL = "pacbot/wheel_vel"  # us -> sim
 N = 15            # cells per side
 PITCH = 0.22      # m, cell centre to cell centre
 WALL_HALF = 0.005  # m, half the wall thickness
-# Cells are (row, col), as the maze drawing and pacbot/poses use: row 0 at
-# the top, column 0 at the left. As in Task 2B, cell (row, col) is centred
-# at world (col * PITCH, (N - 1 - row) * PITCH) - see cell_centre().
 EXIT = (N - 1, N - 1, 3)  # the only opening in the border: -y side of (14, 14)
 
 # Directions: 0 = +x, 1 = +y, 2 = -x, 3 = -y (the numbering pacbot/poses uses).
-# STEP[d] is the (d_row, d_col) of one cell in direction d: +x is the next
-# column, +y the row above.
 STEP = ((0, 1), (-1, 0), (0, -1), (1, 0))
 
 LAYOUT = (
@@ -114,7 +109,6 @@ def inside(row, col):
 
 
 def neighbours(cell):
-    """Open neighbouring cells of `cell`, as (direction, cell) pairs."""
     row, col = cell
     out = []
     for d in range(4):
@@ -130,12 +124,9 @@ TRACK = 0.078             # m, wheel centre to wheel centre
 TICKS_PER_REV = 360       # encoder ticks per wheel revolution
 M_PER_TICK = 2 * math.pi * WHEEL_R / TICKS_PER_REV
 WHEEL_MAX = 30.0          # rad/s, the simulator's clamp
-AXLE_BACK = 0.033         # m, the wheel axle is this far behind the chassis centre
-NO_HIT = 2.0              # m, what a ToF reads when nothing is within its 2 m range
+AXLE_BACK = 0.033         # m, the wheel axle is this far behind chassis centre
+NO_HIT = 2.0              # m, ToF out of range
 
-# ToF sensors: name -> (x, y) from the chassis centre, and the direction
-# the ray points relative to the robot's heading. Note the names:
-# "sl" / "sr" face FORWARD; "fl" / "fr" face the SIDES.
 SENSORS = (
     ("sl", (-0.005, 0.034), 0.0),
     ("sr", (-0.005, -0.034), 0.0),
@@ -154,59 +145,60 @@ def clamp(x, lo, hi):
 
 
 def wheels(v, omega):
-    """(left, right) wheel speeds in rad/s for a forward speed v (m/s) and
-    a turn rate omega (rad/s, positive = counter-clockwise / left)."""
     left = (v - omega * TRACK / 2) / WHEEL_R
     right = (v + omega * TRACK / 2) / WHEEL_R
     return clamp(left, -WHEEL_MAX, WHEEL_MAX), clamp(right, -WHEEL_MAX, WHEEL_MAX)
 
 
 # ------------------------------------------------------- controller tuning
-V_CRUISE = 0.30        # m/s, straight-line top speed
+V_CRUISE = 0.28        # m/s, straight cruise speed
 V_MIN = 0.04           # m/s, creep speed near the stop point
-A_ACC = 1.0            # m/s^2, speed-up ramp
-A_DEC = 0.8            # m/s^2, braking profile used to pick the approach speed
-A_DEC_MAX = 1.5        # m/s^2, fastest allowed slow-down of the command
-STOP_TOL = 0.004       # m, a run ends when the axle is this close to its target
-KH = 2.5               # heading P gain while driving
-KD = 0.30              # heading damping on the turn rate
-KL = 3.0               # lateral P gain: rad of heading offset per m off-centre
-MAX_REF = 0.20         # rad, cap on that heading offset
-OMEGA_MAX = 1.5        # rad/s, cap on the steering command while driving
-KP_TURN = 4.0          # pivot P gain
+A_ACC = 1.0            # m/s^2, acceleration ramp
+A_DEC = 0.8            # m/s^2, braking profile
+A_DEC_MAX = 1.5        # m/s^2, deceleration clamp
+STOP_TOL = 0.004       # m, arrival threshold
+
+# Heading and Wall-Centering Gains
+KH = 2.8               # Heading hold proportional gain
+KD = 0.35              # Angular rate damping (gyro-based)
+KL = 3.5               # Odometry lateral deviation gain
+K_WALL = 6.0           # Active wall-parallel centering gain (rad/s per m offset)
+MAX_REF = 0.20         # rad, clamp on steering bias
+OMEGA_MAX = 1.6        # rad/s, maximum steering limit
+
+KP_TURN = 4.0          # Pivot proportional gain
 W_TURN_MAX = 3.0       # rad/s, fastest pivot
-W_TURN_MIN = 0.3       # rad/s, slowest pivot (avoids stalling)
-TURN_TOL = math.radians(1.2)
-GYRO_TOL = 0.1         # rad/s, "stopped rotating" threshold
-SETTLE_FRAMES = 10     # frames of standing still between actions
-HALF_GAP = (PITCH - 2 * WALL_HALF) / 2   # 0.105 m, cell centre to wall face
-WALL_NEAR = 0.19       # m, a side reading below this means a wall is there
-SIDE_OFF = 0.005       # m, fl/fr sit this far off the centre line
-SENSOR_ARM = AXLE_BACK + 0.036   # m, fl/fr ahead of the axle
-FRONT_ARM = AXLE_BACK - 0.005    # m, sl/sr ahead of the axle
-FRONT_RANGE = 0.8      # m, only trust the front wall reading inside this
-LAT_GAIN = 0.10        # per-frame blend of the side-wall position fix
-FWD_GAIN = 0.30        # per-frame blend of the front-wall position fix
+W_TURN_MIN = 0.3       # rad/s, slowest pivot
+TURN_TOL = math.radians(1.5)
+GYRO_TOL = 0.1         # rad/s
+SETTLE_FRAMES = 10     # Settle frames
 
-# Safety layers using raw ToF readings directly
-STOP_BACK = 0.018      # m, stop this far BEFORE a wall-ended cell centre
-R_HARD = 0.082         # m, front reading at which forward speed is forced to 0
-R_ARRIVE = 0.092       # m, front reading that ends a run that faces a wall
-SIDE_SAFE = 0.065      # m, start steering away when a side reading drops below this
-K_SIDE = 25.0          # rad/s of steering per metre inside SIDE_SAFE
+HALF_GAP = (PITCH - 2 * WALL_HALF) / 2   # 0.105 m
+WALL_NEAR = 0.18       # m, max distance to trust side wall presence
+SIDE_OFF = 0.005       # m, sensor offset from robot center line
+SENSOR_ARM = AXLE_BACK + 0.036   # m
+FRONT_ARM = AXLE_BACK - 0.005    # m
+FRONT_RANGE = 0.8      # m
+LAT_GAIN = 0.12        # Odometry lateral position update
+FWD_GAIN = 0.30        # Odometry longitudinal position update
 
-# Turn safety / heading calibration
-TURN_TIMEOUT = 8.0     # s, give up a pivot after this long
-TURN_RECON = 0.25      # rad, gyro vs encoder heading disagreement that triggers a resync
-CAL_ANGLE = 0.30       # rad, size of the startup calibration wiggle
-CAL_W = 1.2            # rad/s, wiggle speed
+# Safety Repulsion Thresholds
+STOP_BACK = 0.020      # m, stop before cell boundary at front wall
+R_HARD = 0.082         # m, front emergency stop distance
+R_ARRIVE = 0.092       # m, front wall arrival threshold
+SIDE_SAFE = 0.068      # m, distance below which repulsion pushes the robot away
+K_SIDE = 30.0          # rad/s per metre inside SIDE_SAFE
+
+# Turn calibration & safety
+TURN_TIMEOUT = 5.0     # s
+TURN_RECON = 0.25      # rad
+CAL_ANGLE = 0.30       # rad
+CAL_W = 1.2            # rad/s
 
 
 # ============================================================== planning
 
 def plan_route(start, heading, pellet):
-    """Plan the route: from `start` facing `heading`, through `pellet`, out
-    of the exit."""
     start, pellet = tuple(start), tuple(pellet)
     turn_cost = {1: 2.0, 3: 2.0, 2: 3.0}
     first = (start[0], start[1], heading, start == pellet)
@@ -220,7 +212,7 @@ def plan_route(start, heading, pellet):
         if cost > best.get(state, float("inf")):
             continue
         row, col, d, got = state
-        if row == N:                 # outside the maze, below the exit
+        if row == N:
             if got:
                 goal = state
                 break
@@ -268,19 +260,17 @@ class Solver:
     """One sensor frame in, wheel speeds out."""
 
     def __init__(self):
-        self.t = 0.0            # s of sim time since the first sensor frame
-        self.spawn = None       # (dir, cell) of the robot at spawn
-        self.pellet = None      # (row, col) cell of the pellet
-        self.actions = None     # the plan, once made
-        self.prev_ticks = None  # (left, right) encoder ticks last frame
+        self.t = 0.0
+        self.spawn = None
+        self.pellet = None
+        self.actions = None
+        self.prev_ticks = None
         self.done = False
-        # Pose of the wheel AXLE midpoint (the point the robot pivots about),
-        # in world metres / radians. The chassis centre is AXLE_BACK ahead.
         self.x = self.y = self.th = 0.0
-        self.heading = 0        # 0-3, facing at the end of the last action
-        self.cell = None        # (row, col) the axle is in / last stopped in
-        self.queue = []         # actions still to do (plan + initial align)
-        self.phase = "idle"     # idle | run | turn | settle | finished
+        self.heading = 0
+        self.cell = None
+        self.queue = []
+        self.phase = "idle"
         self.settle = 0
         self.v_cmd = 0.0
         self.run_c = (0.0, 0.0)
@@ -290,15 +280,15 @@ class Solver:
         self.turn_target = 0.0
         self.turn_dir = 0
         self.ok_count = 0
-        self.gyro_bias = 0.0    # rad/s, learned while standing still
-        self.track_eff = TRACK  # m, effective track, calibrated against the gyro
-        self.gyro_sign = 1.0    # +1 if gyro z > 0 means counter-clockwise
-        self.gyro_ok = False    # gyro agrees with the encoders (after calibration)
-        self.rate = 0.0         # rad/s, calibrated turn rate
+        self.gyro_bias = 0.0
+        self.track_eff = TRACK
+        self.gyro_sign = 1.0
+        self.gyro_ok = False
+        self.rate = 0.0
         self.dt = 0.01
-        self._dth_enc = 0.0     # this frame's encoder-measured rotation
-        self._g_raw = 0.0       # this frame's bias-corrected gyro rotation (raw sign)
-        self.turn_enc = 0.0     # encoder rotation since the pivot began
+        self._dth_enc = 0.0
+        self._g_raw = 0.0
+        self.turn_enc = 0.0
         self.turn_t = 0.0
         self.turn_start_th = 0.0
         self.after_settle = "idle"
@@ -325,7 +315,7 @@ class Solver:
         ticks = (s["ticks_l"], s["ticks_r"])
         if self.prev_ticks is None:
             self.prev_ticks = ticks
-        # Distance each wheel rolled since the last frame.
+
         d_left = (ticks[0] - self.prev_ticks[0]) * M_PER_TICK
         d_right = (ticks[1] - self.prev_ticks[1]) * M_PER_TICK
         self.prev_ticks = ticks
@@ -338,19 +328,18 @@ class Solver:
             self.log(f"plan: {self.actions}")
             self._start()
 
-        # Dead reckoning: gyro for heading, encoders for distance.
         dt = s["dt"]
         self.dt = dt
         if self.phase == "settle" and d_left == 0 and d_right == 0:
-            self.gyro_bias += 0.1 * (turn_rate - self.gyro_bias)   # stationary: gyro = bias
-        self._g_raw = (turn_rate - self.gyro_bias) * dt
-        self._dth_enc = (d_right - d_left) / self.track_eff        # +ve = counter-clockwise
+            self.gyro_bias += 0.1 * (turn_rate - self.gyro_bias)
 
-        # Calibrated heading update from Pacbot.txt
+        self._g_raw = (turn_rate - self.gyro_bias) * dt
+        self._dth_enc = (d_right - d_left) / self.track_eff
+
         if self.gyro_ok and self.phase != "cal":
-            dth = self.gyro_sign * self._g_raw     # gyro, with the sign verified at startup
+            dth = self.gyro_sign * self._g_raw
         else:
-            dth = self._dth_enc                    # encoders (no drift or sign ambiguity)
+            dth = self._dth_enc
 
         self.rate = dth / dt
         if self.phase == "turn":
@@ -373,12 +362,10 @@ class Solver:
         cx, cy = cell_centre(cell)
         self.x = cx - AXLE_BACK * math.cos(self.th)
         self.y = cy - AXLE_BACK * math.sin(self.th)
-        # ("run", 0) first: drive the axle onto the cell centre so that every
-        # later pivot happens about the middle of a cell (clear of the walls).
         self.queue = [("run", 0)] + list(self.actions)
-        self.phase = "settle"        # stand still ~0.5 s first to learn gyro bias
+        self.phase = "settle"
         self.settle = 50
-        self.after_settle = "cal"    # then a small wiggle to check gyro sign against wheels
+        self.after_settle = "cal"
         self.v_cmd = 0.0
 
     def _control(self, s, gyro):
@@ -423,15 +410,12 @@ class Solver:
             self.run_c = cell_centre(tgt)
             self.run_th = self.th + wrap(d * math.pi / 2 - self.th)
             self.run_front_wall = inside(*tgt) and WALLS[tgt[0], tgt[1], d]
-            # Stop a little short of a wall-ended cell centre to give room to pivot
             self.run_stop = -STOP_BACK if self.run_front_wall else 0.0
             self.v_cmd = 0.0
             self.phase = "run"
             self.log(f"run {val} -> cell {tgt}")
 
     def _calibrate(self):
-        """Wiggle left by CAL_ANGLE using ENCODERS as ground truth, compare
-        with the gyro, then pivot back to lock sign and effective track."""
         c = self.cal
         c["t"] += self.dt
         c["enc"] += self._dth_enc
@@ -442,7 +426,7 @@ class Solver:
                 return 0.0, 0.0
             return wheels(0.0, CAL_W)
         c["n"] += 1
-        if c["n"] < 15:                       # let robot coast to a complete stop
+        if c["n"] < 15:
             return 0.0, 0.0
         e, g = c["enc"], c["gyro"]
         if abs(g) > 0.08 and abs(e) > 0.15 and e * g != 0:
@@ -455,7 +439,6 @@ class Solver:
         self.log(f"calibration: enc={e:+.3f} gyro={g:+.3f} sign={self.gyro_sign:+.0f} "
                  f"track={self.track_eff:.4f} gyro_ok={self.gyro_ok}")
 
-        # Reset heading and pivot back to spawn heading
         self.th = c["th0"] + est
         self.turn_target = c["th0"]
         self.turn_dir = self.heading
@@ -473,7 +456,6 @@ class Solver:
         return 0.0, 0.0
 
     def _turn(self, gyro):
-        # Cross-reconcile gyro heading with wheel encoders to kill drift/runaway
         if abs((self.th - self.turn_start_th) - self.turn_enc) > TURN_RECON:
             self.th = self.turn_start_th + self.turn_enc
 
@@ -485,7 +467,6 @@ class Solver:
         if self.ok_count >= 5:
             return self._finish_turn()
 
-        # Safety timeouts and encoder limit guards preventing continuous 360 rotation
         planned = abs(wrap(self.turn_target - self.turn_start_th))
         if self.turn_t > TURN_TIMEOUT or abs(self.turn_enc) > planned + 1.0:
             self.log("pivot limit reached; stopping the turn")
@@ -510,9 +491,9 @@ class Solver:
         elif fr < WALL_NEAR:
             e = fr - (HALF_GAP - SIDE_OFF)
         if e is not None:
-            e -= SENSOR_ARM * math.sin(eps)       # sensors are ahead of axle
+            e -= SENSOR_ARM * math.sin(eps)
             cur = (self.x - cx) * nx + (self.y - cy) * ny
-            if abs(e - cur) < 0.06:               # reject sensor outlier jumps
+            if abs(e - cur) < 0.06:
                 k = LAT_GAIN * (e - cur)
                 self.x += k * nx
                 self.y += k * ny
@@ -528,17 +509,21 @@ class Solver:
     def _run(self, s):
         dt = s["dt"]
         ux, uy = math.cos(self.run_th), math.sin(self.run_th)
-        nx, ny = -uy, ux                      # left-hand normal of lane
+        nx, ny = -uy, ux                      # left normal of the lane
         cx, cy = self.run_c
         eps = wrap(self.th - self.run_th)
+
+        # Dead-reckoning lateral and front position update
         if abs(eps) < 0.15:
             self._correct(s, ux, uy, nx, ny, eps)
+
         along = (self.x - cx) * ux + (self.y - cy) * uy
         lateral = (self.x - cx) * nx + (self.y - cy) * ny
         rem = self.run_stop - along
 
-        # Raw front ToF check to trigger arrival at wall stop
+        fl, fr = s["fl"], s["fr"]
         r_front = min(s["sl"], s["sr"])
+
         if self.run_front_wall and r_front <= R_ARRIVE:
             rem = 0.0
 
@@ -546,7 +531,7 @@ class Solver:
             self.x += rem * ux
             self.y += rem * uy
             self.cell = self.run_cell
-            if abs(eps) < 0.1:                # snap out heading drift
+            if abs(eps) < 0.1:
                 self.th = self.run_th
             self.v_cmd = 0.0
             self.phase = "settle"
@@ -554,7 +539,6 @@ class Solver:
             return 0.0, 0.0
 
         v_des = clamp(math.sqrt(2 * A_DEC * rem), V_MIN, V_CRUISE)
-        # Independent raw ToF safety braking ceiling
         if r_front < 0.35:
             v_des = min(v_des, math.sqrt(2 * A_DEC * max(r_front - R_HARD, 0.0)))
 
@@ -563,11 +547,24 @@ class Solver:
         else:
             self.v_cmd = max(v_des, self.v_cmd - A_DEC_MAX * dt)
 
+        # -------------------------------------------------------------
+        # Active Parallel Wall-Centering & Collision Avoidance
+        # -------------------------------------------------------------
         ref = self.run_th - clamp(KL * lateral, -MAX_REF, MAX_REF)
         omega = KH * wrap(ref - self.th) - KD * self.rate
 
-        # Side collision avoidance push
-        fl, fr = s["fl"], s["fr"]
+        # Direct sensor lane centering to drive parallel to walls
+        if fl < WALL_NEAR and fr < WALL_NEAR:
+            sensor_lat_err = 0.5 * (fr - fl)
+            omega += K_WALL * clamp(sensor_lat_err, -0.04, 0.04)
+        elif fl < WALL_NEAR:
+            sensor_lat_err = (HALF_GAP - SIDE_OFF) - fl
+            omega += K_WALL * clamp(sensor_lat_err, -0.04, 0.04)
+        elif fr < WALL_NEAR:
+            sensor_lat_err = fr - (HALF_GAP - SIDE_OFF)
+            omega += K_WALL * clamp(sensor_lat_err, -0.04, 0.04)
+
+        # Emergency repulsion if nearing either wall face
         if fl < SIDE_SAFE:
             omega -= K_SIDE * (SIDE_SAFE - fl)
         if fr < SIDE_SAFE:
